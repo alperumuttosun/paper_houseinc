@@ -1,0 +1,2499 @@
+# =============================================================================
+# HouseInc Multinational Survey - analysis script (steps 00-12, then 08)
+# Data: Zenodo, DOI 10.5281/zenodo.20538396 (CC BY 4.0)
+# Steps whose output files already exist are skipped; set the matching element
+# of `force_rerun` to TRUE to recompute a step.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. Configuration
+# -----------------------------------------------------------------------------
+options(timeout = 900, stringsAsFactors = FALSE, scipen = 999)
+
+force_rerun <- c(step00 = FALSE, step01 = FALSE, step02 = FALSE, step03 = FALSE,
+                 step04 = FALSE, step05 = FALSE, step06 = FALSE, step07 = FALSE,
+                 step09 = FALSE, step10 = FALSE, step11 = FALSE, step12 = FALSE,
+                 step08 = TRUE)                    # TRUE = recompute that step
+sparse_threshold <- 20                             # minimum count per response category
+
+# Step 09 settings
+dwell_exclude    <- "FI"           # countries whose dwelling-defect mean is not identified
+epc_release_cut  <- 0.20           # |standardised EPC| for country-specific intercept release
+topup_from       <- "2025-07-01"   # interviews started on/after this date = top-up fieldwork
+boot_B           <- 200            # bootstrap replicates of the two-stage procedure
+boot_max_hours   <- 15             # stop starting new replicates after this many hours
+boot_seed        <- 20251117
+
+# Project root: environment variable, then local paths, then working directory
+root_candidates <- c(Sys.getenv("HOUSEINC_ROOT"),
+                     "C:/Users/Alper.Tosun/Desktop/cru130/paper_houseinc",
+                     "C:/Users/autos/OneDrive/Desktop/cru130/paper_houseinc")
+root_candidates <- root_candidates[nzchar(root_candidates)]
+existing_root   <- root_candidates[dir.exists(dirname(root_candidates))][1]
+proj_dir <- if (is.na(existing_root)) getwd() else existing_root
+
+data_dir <- file.path(proj_dir, "data")
+out_dir  <- file.path(proj_dir, "output")
+for (d in c(proj_dir, data_dir, out_dir)) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# 1. Packages
+# -----------------------------------------------------------------------------
+pkgs <- c("jsonlite", "arrow", "readxl", "data.table", "psych", "lavaan", "semTools", "MASS", "ggplot2", "openxlsx")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+suppressPackageStartupMessages(library(data.table))
+
+# -----------------------------------------------------------------------------
+# 2. Helper functions
+# -----------------------------------------------------------------------------
+# TRUE when every listed output file is present in out_dir
+outputs_exist <- function(files) all(file.exists(file.path(out_dir, files)))
+
+# Write a UTF-8 CSV with BOM so that Excel opens it correctly
+write_out <- function(x, file) fwrite(x, file.path(out_dir, file), bom = TRUE)
+
+# Force valid UTF-8 strings; invalid bytes are re-read as latin1
+fix_utf8 <- function(x) {
+  x   <- enc2utf8(x)
+  bad <- !is.na(x) & !validUTF8(x)
+  x[bad] <- iconv(x[bad], from = "latin1", to = "UTF-8", sub = "?")
+  x
+}
+
+# TRUE when the file exists and matches the published md5 checksum
+md5_ok <- function(path, md5) file.exists(path) && unname(tools::md5sum(path)) == md5
+
+# Map character responses to integer codes; unmapped values become NA
+recode_map <- function(x, map) unname(map[trimws(as.character(x))])
+
+# Upper triangle of a correlation matrix in long format
+mat_to_long <- function(m) {
+  idx <- which(upper.tri(m), arr.ind = TRUE)
+  data.frame(item_i = rownames(m)[idx[, 1]],
+             item_j = colnames(m)[idx[, 2]],
+             r      = round(m[idx], 4))
+}
+
+# =============================================================================
+# STEP 00 - Data acquisition and variable inventory
+# =============================================================================
+record_id <- "20538396"
+files_tbl <- data.frame(
+  key = c("houseinc_clean_anonimised.parquet",
+          "houseinc_metadata.xlsx",
+          "houseinc_clean_anonimised.csv"),
+  md5 = c("5e27ada20235787fef51656ae9c82644",
+          "705d509b5cc1d330d76f967344815fc8",
+          "d86778debadcf33f603903fd9c0e6131")
+)
+
+# Download a file once; route A uses the Zenodo API link, route B the direct link
+download_one <- function(key, md5) {
+  dest <- file.path(data_dir, key)
+  if (md5_ok(dest, md5)) return(TRUE)
+
+  api_meta <- tryCatch(
+    jsonlite::fromJSON(paste0("https://zenodo.org/api/records/", record_id),
+                       simplifyVector = FALSE),
+    error = function(e) NULL)
+  if (!is.null(api_meta)) {
+    hit <- Filter(function(f) identical(f$key, key), api_meta$files)
+    if (length(hit) > 0) {
+      try(download.file(hit[[1]]$links$self, dest, mode = "wb"), silent = TRUE)
+      if (md5_ok(dest, md5)) return(TRUE)
+    }
+  }
+
+  url_b <- paste0("https://zenodo.org/records/", record_id, "/files/", key, "?download=1")
+  try(download.file(url_b, dest, mode = "wb"), silent = TRUE)
+  if (md5_ok(dest, md5)) return(TRUE)
+
+  warning("Download failed or checksum mismatch: ", key)
+  FALSE
+}
+
+ok_parquet  <- download_one(files_tbl$key[1], files_tbl$md5[1])
+ok_codebook <- download_one(files_tbl$key[2], files_tbl$md5[2])
+
+# Read data: route A parquet, route B csv
+hi <- NULL
+if (ok_parquet) {
+  hi <- tryCatch(as.data.frame(arrow::read_parquet(file.path(data_dir, files_tbl$key[1]))),
+                 error = function(e) { message("Parquet read failed: ", conditionMessage(e)); NULL })
+}
+if (is.null(hi) && download_one(files_tbl$key[3], files_tbl$md5[3])) {
+  hi <- fread(file.path(data_dir, files_tbl$key[3]), encoding = "UTF-8",
+              data.table = FALSE, na.strings = c("", "NA"))
+}
+if (is.null(hi)) stop("Data could not be read via parquet or csv.")
+
+names(hi) <- fix_utf8(names(hi))
+hi[] <- lapply(hi, function(x) if (is.character(x)) fix_utf8(x) else x)
+
+step00_files <- c("step00_summary.csv", "step00_variable_inventory.csv",
+                  "step00_country_sample_freq.csv", "step00_codebook_sheets.csv")
+
+if (!force_rerun["step00"] && outputs_exist(step00_files)) {
+  message("Step 00 outputs found - skipped.")
+} else {
+  message("Running step 00 ...")
+
+  write_out(data.frame(
+    item  = c("n_rows", "n_cols", "n_duplicated_rows", "data_source"),
+    value = c(nrow(hi), ncol(hi), sum(duplicated(hi)), ifelse(ok_parquet, "parquet", "csv"))
+  ), "step00_summary.csv")
+
+  n_miss <- function(x) if (is.character(x)) sum(is.na(x) | trimws(x) == "") else sum(is.na(x))
+  examples <- function(x) substr(paste(head(unique(x[!is.na(x)]), 8), collapse = " | "), 1, 150)
+  write_out(data.frame(
+    variable    = names(hi),
+    class       = vapply(hi, function(x) class(x)[1], character(1)),
+    n_missing   = vapply(hi, n_miss, numeric(1)),
+    pct_missing = round(100 * vapply(hi, n_miss, numeric(1)) / nrow(hi), 2),
+    n_unique    = vapply(hi, function(x) length(unique(x[!is.na(x)])), numeric(1)),
+    examples    = vapply(hi, examples, character(1))
+  ), "step00_variable_inventory.csv")
+
+  cand <- grep("country|sample|repr|weight", names(hi), ignore.case = TRUE, value = TRUE)
+  freq <- rbindlist(lapply(cand, function(v) {
+    if (length(unique(hi[[v]])) <= 40) {
+      tb <- as.data.frame(table(hi[[v]], useNA = "ifany"))
+      setNames(data.frame(v, tb), c("variable", "value", "n"))
+    }
+  }), fill = TRUE)
+  write_out(freq, "step00_country_sample_freq.csv")
+
+  if (ok_codebook) {
+    write_out(data.frame(codebook_sheets =
+                           readxl::excel_sheets(file.path(data_dir, files_tbl$key[2]))),
+              "step00_codebook_sheets.csv")
+  }
+}
+
+# =============================================================================
+# STEP 01 - Item recoding and descriptive diagnostics
+# =============================================================================
+# All items are coded so that higher values indicate greater deprivation.
+
+item_spec <- data.frame(
+  item = c("DP_LEAK", "DP_DAMP", "DP_ROT", "DP_MOULD1", "DP_MOULD2", "DP_MOULD3",
+           "AFF_HEAT", "ARREARS", "FINBURDEN_ECOST", "COMF_COOL", "LACK_ENERGY_APP_HEATING",
+           "FIN_BURD_HOUSECOST", "FIN_COMF",
+           "RED_LIVING_COST_LESS_FOOD", "RED_LIVING_COST_BORROW_MONEY",
+           "RED_LIVING_COST_USE_CREDIT"),
+  construct = c(rep("dwelling_defects", 6),
+                rep("energy_deprivation", 5),
+                rep("housing_cost_strain", 5)),
+  n_cat = c(rep(2, 6), 3, 3, 5, 3, 2, 3, 5, 2, 2, 2),
+  coding = c(rep("0 = not reported; 1 = reported", 6),
+             "0 = yes; 1 = some rooms only; 2 = no",
+             "0 = no; 1 = at least once; 2 = at least twice; DK/refusal = NA",
+             "0 = strongly disagree ... 4 = strongly agree",
+             "0 = yes; 1 = some rooms only; 2 = no",
+             "0 = not lacking; 1 = lacking",
+             "0 = no burden; 1 = slight burden; 2 = heavy burden",
+             "0 = living very comfortably ... 4 = finding it very difficult",
+             rep("0 = not selected; 1 = selected", 3))
+)
+items <- item_spec$item
+
+missing_items <- setdiff(items, names(hi))
+if (length(missing_items) > 0) stop("Items not found in data: ", paste(missing_items, collapse = ", "))
+
+# Leading integer of labels such as "2 - A slight burden"
+lead_int <- function(x) suppressWarnings(as.integer(sub("^\\s*(\\d+).*$", "\\1", as.character(x))))
+
+# Integer within an admissible range, otherwise NA
+in_range <- function(x, lo, hi_) { x <- suppressWarnings(as.integer(as.character(x))); x[!x %in% lo:hi_] <- NA; x }
+
+rec <- data.frame(ResponseId = hi$ResponseId,
+                  country    = hi$COUNTRY_R,
+                  rep_sample = as.logical(hi$REP_SAMPLE))
+
+for (v in item_spec$item[item_spec$construct == "dwelling_defects"]) rec[[v]] <- in_range(hi[[v]], 0, 1)
+rec$AFF_HEAT        <- recode_map(hi$AFF_HEAT,  c("Yes" = 0, "Some" = 1, "No" = 2))
+rec$COMF_COOL       <- recode_map(hi$COMF_COOL, c("Yes" = 0, "Some" = 1, "No" = 2))
+rec$ARREARS         <- recode_map(hi$ARREARS, c("No" = 0,
+                                                "Yes, at least once per year" = 1,
+                                                "Yes, at least twice per year" = 2))
+rec$FINBURDEN_ECOST <- in_range(hi$FINBURDEN_ECOST, 1, 5) - 1L
+rec$LACK_ENERGY_APP_HEATING <- in_range(hi$LACK_ENERGY_APP_HEATING, 0, 1)
+rec$FIN_BURD_HOUSECOST <- 3L - lead_int(hi$FIN_BURD_HOUSECOST)
+rec$FIN_BURD_HOUSECOST[!rec$FIN_BURD_HOUSECOST %in% 0:2] <- NA
+rec$FIN_COMF        <- 5L - in_range(hi$FIN_COMF, 1, 5)
+for (v in c("RED_LIVING_COST_LESS_FOOD", "RED_LIVING_COST_BORROW_MONEY",
+            "RED_LIVING_COST_USE_CREDIT")) rec[[v]] <- in_range(hi[[v]], 0, 1)
+
+step01_files <- c("step01_item_dictionary.csv", "step01_recode_check.csv",
+                  "step01_item_distribution.csv", "step01_item_prevalence_wide.csv",
+                  "step01_sparsity_flags.csv", "step01_missing_by_country.csv",
+                  "step01_polychoric_long.csv", "step01_polychoric_log.csv")
+
+if (!force_rerun["step01"] && outputs_exist(step01_files)) {
+  message("Step 01 outputs found - skipped.")
+} else {
+  message("Running step 01 ...")
+
+  # 01a. Item dictionary with codebook wording
+  wording <- rep(NA_character_, length(items))
+  if (ok_codebook) {
+    vm <- as.data.frame(readxl::read_excel(file.path(data_dir, files_tbl$key[2]),
+                                           sheet = "Variable meta data"))
+    names(vm) <- trimws(names(vm))
+    vm$Variable <- trimws(as.character(vm$Variable))
+    parent <- sub("^(DP|LACK_ENERGY_APP|RED_LIVING_COST)_.*$", "\\1", items)
+    parent[parent == "DP"] <- "DWELL_PROB"
+    wording <- fix_utf8(gsub("\\s+", " ", vm$Detail[match(parent, vm$Variable)]))
+  }
+  write_out(cbind(item_spec, question_wording = wording), "step01_item_dictionary.csv")
+
+  # 01b. Cross-tabulation of original vs recoded values (audit trail)
+  write_out(rbindlist(lapply(items, function(v) {
+    tb <- as.data.frame(table(original = as.character(hi[[v]]),
+                              recoded  = rec[[v]], useNA = "ifany"))
+    data.frame(item = v, tb[tb$Freq > 0, ])
+  })), "step01_recode_check.csv")
+
+  # 01c. Response distributions by sample, country and item
+  long <- melt(as.data.table(rec), id.vars = c("ResponseId", "country", "rep_sample"),
+               measure.vars = items, variable.name = "item", value.name = "category",
+               variable.factor = FALSE)
+  long_all <- rbind(
+    long[, .(sample = "full", country, item, category)],
+    long[rep_sample == TRUE, .(sample = "representative", country, item, category)]
+  )
+  long_all <- rbind(long_all, copy(long_all)[, country := "POOLED"])
+
+  dist <- long_all[, .N, by = .(sample, country, item, category)]
+  dist[, pct_valid := ifelse(is.na(category), NA_real_,
+                             round(100 * N / sum(N[!is.na(category)]), 2)),
+       by = .(sample, country, item)]
+  setorder(dist, sample, item, country, category)
+  write_out(dist, "step01_item_distribution.csv")
+
+  # 01d. Share of respondents above the lowest category (quick prevalence view)
+  prev <- long_all[!is.na(category), .(pct_any = round(100 * mean(category > 0), 2)),
+                   by = .(sample, item, country)]
+  write_out(dcast(prev, sample + item ~ country, value.var = "pct_any"),
+            "step01_item_prevalence_wide.csv")
+
+  # 01e. Sparsity diagnostics: empty or thin categories per country
+  obs_cat <- dist[!is.na(category), .(n_observed_cat = .N, min_cell_n = min(N),
+                                      min_cell_pct = min(pct_valid)),
+                  by = .(sample, country, item)]
+  obs_cat <- merge(obs_cat, item_spec[, c("item", "n_cat")], by = "item")
+  obs_cat[, empty_category := n_observed_cat < n_cat]
+  obs_cat[, sparse_category := min_cell_n < sparse_threshold]
+  setorder(obs_cat, sample, item, country)
+  write_out(obs_cat, "step01_sparsity_flags.csv")
+
+  # 01f. Missingness by country, incl. non-substantive answers to ARREARS
+  miss <- long_all[, .(n = .N, n_missing = sum(is.na(category)),
+                       pct_missing = round(100 * mean(is.na(category)), 2)),
+                   by = .(sample, country, item)]
+  write_out(miss, "step01_missing_by_country.csv")
+
+  # 01g. Polychoric/tetrachoric correlations per country
+  # Route A: psych::polychoric; route B: lavaan::lavCor (pairwise deletion)
+  poly_A <- function(x) suppressWarnings(
+    psych::polychoric(x, correct = 0, global = FALSE, smooth = TRUE)$rho)
+  poly_B <- function(x) as.matrix(
+    lavaan::lavCor(x, ordered = names(x), missing = "pairwise", output = "cor"))
+
+  poly_out <- list(); poly_log <- list()
+  groups <- c(sort(unique(rec$country)), "POOLED")
+  for (smp in c("representative", "full")) {
+    for (g in groups) {
+      d <- rec
+      if (smp == "representative") d <- d[d$rep_sample %in% TRUE, ]
+      if (g != "POOLED") d <- d[d$country == g, ]
+      x <- d[, items]
+      keep <- vapply(x, function(z) length(unique(z[!is.na(z)])) > 1, logical(1))
+      x <- x[, keep, drop = FALSE]
+
+      m <- tryCatch(poly_A(x), error = function(e) NULL); route <- "A_psych"
+      if (is.null(m)) { m <- tryCatch(poly_B(x), error = function(e) NULL); route <- "B_lavaan" }
+      if (is.null(m)) route <- "failed"
+
+      poly_log[[length(poly_log) + 1]] <- data.frame(
+        sample = smp, country = g, n = nrow(x), route = route,
+        dropped_constant_items = paste(names(keep)[!keep], collapse = ";"))
+      if (!is.null(m)) {
+        dimnames(m) <- list(names(x), names(x))
+        poly_out[[length(poly_out) + 1]] <- data.frame(sample = smp, country = g,
+                                                       mat_to_long(m))
+      }
+    }
+  }
+  poly_long <- rbindlist(poly_out)
+  poly_long <- merge(poly_long, setNames(item_spec[, c("item", "construct")], c("item_i", "construct_i")), by = "item_i")
+  poly_long <- merge(poly_long, setNames(item_spec[, c("item", "construct")], c("item_j", "construct_j")), by = "item_j")
+  poly_long[, block := ifelse(construct_i == construct_j, "within", "between")]
+  setcolorder(poly_long, c("sample", "country", "item_i", "item_j", "r",
+                           "construct_i", "construct_j", "block"))
+  setorder(poly_long, sample, country, item_i, item_j)
+  write_out(poly_long, "step01_polychoric_long.csv")
+  write_out(rbindlist(poly_log), "step01_polychoric_log.csv")
+}
+
+
+# =============================================================================
+# STEP 02 - Country-specific ordinal CFA of competing factor structures
+# =============================================================================
+# Item selection after step 01 diagnostics:
+#   DP_MOULD3 dropped (one or zero endorsements in Finland)
+#   COMF_COOL, LACK_ENERGY_APP_HEATING dropped (weak, inconsistent associations
+#   with the affordability items)
+# Nested structures (same 13 indicators):
+#   M1 one factor  <  M2 dwelling + affordability  <  M3 dwelling + energy + cost
+# Estimation: route A WLSMV, route B ULSMV; delta parameterisation; pairwise NA.
+
+cfa_dwell  <- c("DP_LEAK", "DP_DAMP", "DP_ROT", "DP_MOULD1", "DP_MOULD2")
+cfa_energy <- c("AFF_HEAT", "ARREARS", "FINBURDEN_ECOST")
+cfa_cost   <- c("FIN_BURD_HOUSECOST", "FIN_COMF", "RED_LIVING_COST_LESS_FOOD",
+                "RED_LIVING_COST_BORROW_MONEY", "RED_LIVING_COST_USE_CREDIT")
+cfa_items  <- c(cfa_dwell, cfa_energy, cfa_cost)
+
+lhs_rhs <- function(f, it) paste(f, "=~", paste(it, collapse = " + "))
+cfa_models <- list(
+  M1_one_factor   = lhs_rhs("DEPRIV", cfa_items),
+  M2_two_factor   = paste(lhs_rhs("DWELL", cfa_dwell),
+                          lhs_rhs("AFFORD", c(cfa_energy, cfa_cost)), sep = "\n"),
+  M3_three_factor = paste(lhs_rhs("DWELL", cfa_dwell),
+                          lhs_rhs("ENERGY", cfa_energy),
+                          lhs_rhs("COST", cfa_cost), sep = "\n")
+)
+
+fit_names <- c("npar", "chisq.scaled", "df.scaled", "pvalue.scaled", "cfi.scaled",
+               "tli.scaled", "rmsea.scaled", "rmsea.ci.lower.scaled",
+               "rmsea.ci.upper.scaled", "srmr")
+
+# Fit one model; collect warnings; fall back from WLSMV to ULSMV if needed
+fit_cfa <- function(model, d) {
+  converged <- function(f) !inherits(f, "error") && isTRUE(lavaan::lavInspect(f, "converged"))
+  warn <- character(0)
+  run <- function(est) withCallingHandlers(
+    tryCatch(lavaan::cfa(model, data = d, ordered = cfa_items, estimator = est,
+                         std.lv = TRUE, missing = "pairwise"),
+             error = function(e) e),
+    warning = function(w) { warn <<- c(warn, conditionMessage(w)); invokeRestart("muffleWarning") })
+  f <- run("WLSMV"); route <- "A_WLSMV"
+  if (!converged(f)) { warn <- character(0); f <- run("ULSMV"); route <- "B_ULSMV" }
+  if (!converged(f)) {
+    msg <- if (inherits(f, "error")) conditionMessage(f) else "not converged"
+    return(list(fit = NULL, route = "failed", warn = msg))
+  }
+  list(fit = f, route = route, warn = paste(unique(warn), collapse = " | "))
+}
+
+step02_files <- c("step02_fit_by_country.csv", "step02_std_loadings.csv",
+                  "step02_factor_correlations.csv", "step02_model_comparison.csv",
+                  "step02_top_modindices.csv")
+
+if (!force_rerun["step02"] && outputs_exist(step02_files)) {
+  message("Step 02 outputs found - skipped.")
+} else {
+  message("Running step 02 ...")
+  fit_tab <- list(); load_tab <- list(); cor_tab <- list(); cmp_tab <- list(); mi_tab <- list()
+  groups <- c(sort(unique(rec$country)), "POOLED")
+
+  for (smp in c("full", "representative")) {
+    for (g in groups) {
+      d <- rec
+      if (smp == "representative") d <- d[d$rep_sample %in% TRUE, ]
+      if (g != "POOLED") d <- d[d$country == g, ]
+      d <- d[, cfa_items]
+      fits <- list()
+
+      for (m in names(cfa_models)) {
+        res <- fit_cfa(cfa_models[[m]], d)
+        key <- data.frame(sample = smp, country = g, model = m, n = nrow(d), route = res$route)
+        if (is.null(res$fit)) {
+          fit_tab[[length(fit_tab) + 1]] <- cbind(key, warnings = res$warn)
+          next
+        }
+        fits[[m]] <- res$fit
+        fm <- lavaan::fitMeasures(res$fit)
+        fm <- as.list(round(fm[intersect(fit_names, names(fm))], 4))
+        fit_tab[[length(fit_tab) + 1]] <- cbind(key, as.data.frame(fm), warnings = res$warn)
+
+        ss <- lavaan::standardizedSolution(res$fit)
+        ld <- ss[ss$op == "=~", c("lhs", "rhs", "est.std", "se", "pvalue")]
+        load_tab[[length(load_tab) + 1]] <- cbind(key[, 1:3], ld)
+        lv <- unique(ss$lhs[ss$op == "=~"])
+        fc <- ss[ss$op == "~~" & ss$lhs != ss$rhs & ss$lhs %in% lv & ss$rhs %in% lv,
+                 c("lhs", "rhs", "est.std", "se", "ci.lower", "ci.upper")]
+        if (nrow(fc) > 0) cor_tab[[length(cor_tab) + 1]] <- cbind(key[, 1:3], fc)
+
+        if (m != "M1_one_factor") {
+          mi <- tryCatch(lavaan::modindices(res$fit, sort. = TRUE, maximum.number = 10),
+                         error = function(e) NULL)
+          if (!is.null(mi) && nrow(mi) > 0)
+            mi_tab[[length(mi_tab) + 1]] <- cbind(key[, 1:3],
+                                                  mi[, c("lhs", "op", "rhs", "mi", "sepc.all")])
+        }
+      }
+
+      # Scaled chi-square difference tests between nested models
+      pairs <- list(c("M1_one_factor", "M2_two_factor"), c("M2_two_factor", "M3_three_factor"))
+      for (pr in pairs) {
+        if (all(pr %in% names(fits))) {
+          lrt <- tryCatch(lavaan::lavTestLRT(fits[[pr[1]]], fits[[pr[2]]]), error = function(e) NULL)
+          if (!is.null(lrt)) cmp_tab[[length(cmp_tab) + 1]] <- data.frame(
+            sample = smp, country = g, restricted = pr[1], general = pr[2],
+            chisq_diff = round(lrt[2, "Chisq diff"], 3), df_diff = lrt[2, "Df diff"],
+            p_value = signif(lrt[2, "Pr(>Chisq)"], 4))
+        }
+      }
+    }
+  }
+
+  write_out(rbindlist(fit_tab, fill = TRUE), "step02_fit_by_country.csv")
+  write_out(rbindlist(load_tab), "step02_std_loadings.csv")
+  write_out(rbindlist(cor_tab),  "step02_factor_correlations.csv")
+  write_out(rbindlist(cmp_tab),  "step02_model_comparison.csv")
+  write_out(rbindlist(mi_tab),   "step02_top_modindices.csv")
+}
+
+
+# =============================================================================
+# STEP 03 - Multi-group measurement invariance across countries
+# =============================================================================
+# Baseline: two-factor structure (DWELL, AFFORD) selected in step 02, plus three
+# a-priori residual covariances motivated by item content:
+#   borrowing ~ credit (same debt-coping block), the two "financial burden"
+#   items (shared wording), the two mould items (shared content).
+# Sequence (Wu & Estabrook, 2016): configural -> thresholds -> + loadings ->
+#   + intercepts. Theta parameterisation, WLSMV, full sample.
+# Route A: semTools::measEq.syntax identification; route B: lavaan group.equal.
+
+inv_model <- paste(cfa_models$M2_two_factor,
+                   "RED_LIVING_COST_BORROW_MONEY ~~ RED_LIVING_COST_USE_CREDIT",
+                   "FINBURDEN_ECOST ~~ FIN_BURD_HOUSECOST",
+                   "DP_MOULD1 ~~ DP_MOULD2", sep = "\n")
+
+inv_levels <- list(configural = "",
+                   thresholds = "thresholds",
+                   metric     = c("thresholds", "loadings"),
+                   scalar     = c("thresholds", "loadings", "intercepts"))
+
+fit_invariance <- function(level_constraints, d, partial = "", model = inv_model) {
+  ord  <- intersect(cfa_items, names(d))
+  warn <- character(0)
+  catch_warn <- function(w) { warn <<- c(warn, conditionMessage(w)); invokeRestart("muffleWarning") }
+  converged  <- function(f) !inherits(f, "error") && isTRUE(lavaan::lavInspect(f, "converged"))
+
+  f <- withCallingHandlers(tryCatch({
+    syn <- semTools::measEq.syntax(configural.model = model, data = d,
+                                   ordered = ord, parameterization = "theta",
+                                   ID.fac = "std.lv", ID.cat = "Wu.Estabrook.2016",
+                                   group = "country", group.equal = level_constraints,
+                                   group.partial = partial)
+    lavaan::cfa(as.character(syn), data = d, group = "country", ordered = ord,
+                parameterization = "theta", estimator = "WLSMV", missing = "pairwise")
+  }, error = function(e) e), warning = catch_warn)
+  route <- "A_measEq"
+
+  if (!converged(f)) {
+    warn <- character(0)
+    f <- withCallingHandlers(tryCatch(
+      lavaan::cfa(model, data = d, group = "country", ordered = ord,
+                  parameterization = "theta", estimator = "WLSMV", missing = "pairwise",
+                  group.equal = level_constraints, group.partial = partial),
+      error = function(e) e), warning = catch_warn)
+    route <- "B_lavaan"
+  }
+  if (!converged(f)) {
+    msg <- if (inherits(f, "error")) conditionMessage(f) else "not converged"
+    return(list(fit = NULL, route = "failed", warn = msg))
+  }
+  list(fit = f, route = route, warn = paste(unique(warn), collapse = " | "))
+}
+
+step03_files <- c("step03_invariance_fit.csv", "step03_invariance_tests.csv",
+                  "step03_configural_loadings.csv", "step03_warnings_log.csv")
+
+if (!force_rerun["step03"] && outputs_exist(step03_files)) {
+  message("Step 03 outputs found - skipped.")
+} else {
+  message("Running step 03 (may take several minutes) ...")
+  d_inv <- rec[, c("country", cfa_items)]
+  d_inv$country <- as.character(d_inv$country)
+
+  inv_fits <- list(); fit_rows <- list(); warn_rows <- list()
+  for (lv in names(inv_levels)) {
+    res <- fit_invariance(inv_levels[[lv]], d_inv)
+    warn_rows[[lv]] <- data.frame(level = lv, route = res$route, warnings = res$warn)
+    if (is.null(res$fit)) next
+    inv_fits[[lv]] <- res$fit
+    fm <- lavaan::fitMeasures(res$fit)
+    fm <- as.list(round(fm[intersect(fit_names, names(fm))], 4))
+    fit_rows[[lv]] <- cbind(data.frame(level = lv, route = res$route), as.data.frame(fm))
+  }
+  fit_inv_tab <- rbindlist(fit_rows, fill = TRUE)
+  write_out(fit_inv_tab, "step03_invariance_fit.csv")
+  write_out(rbindlist(warn_rows), "step03_warnings_log.csv")
+
+  # Consecutive nested comparisons: scaled chi-square difference + fit-index changes
+  lv_names <- intersect(names(inv_levels), names(inv_fits))
+  test_rows <- list()
+  for (k in seq_along(lv_names)[-1]) {
+    a <- lv_names[k - 1]; b <- lv_names[k]
+    lrt <- tryCatch(lavaan::lavTestLRT(inv_fits[[b]], inv_fits[[a]]), error = function(e) NULL)
+    fa <- fit_inv_tab[level == a]; fb <- fit_inv_tab[level == b]
+    test_rows[[b]] <- data.frame(
+      restricted = b, general = a,
+      chisq_diff = if (is.null(lrt)) NA else round(lrt[2, "Chisq diff"], 3),
+      df_diff    = if (is.null(lrt)) NA else lrt[2, "Df diff"],
+      p_value    = if (is.null(lrt)) NA else signif(lrt[2, "Pr(>Chisq)"], 4),
+      delta_cfi   = round(fb$cfi.scaled   - fa$cfi.scaled, 4),
+      delta_rmsea = round(fb$rmsea.scaled - fa$rmsea.scaled, 4),
+      delta_srmr  = round(fb$srmr         - fa$srmr, 4))
+  }
+  write_out(rbindlist(test_rows), "step03_invariance_tests.csv")
+
+  # Country-specific standardised loadings and thresholds from the configural model
+  if (!is.null(inv_fits$configural)) {
+    ss <- lavaan::standardizedSolution(inv_fits$configural)
+    glab <- lavaan::lavInspect(inv_fits$configural, "group.label")
+    ss <- ss[ss$op %in% c("=~", "|"), c("group", "lhs", "op", "rhs", "est.std", "se")]
+    ss$country <- glab[ss$group]
+    write_out(ss[, c("country", "lhs", "op", "rhs", "est.std", "se")],
+              "step03_configural_loadings.csv")
+  }
+}
+
+
+# =============================================================================
+# STEP 04 - Partial scalar invariance and comparison of country means
+# =============================================================================
+# 04a. Univariate score tests for every equality constraint of the scalar model
+# 04b. Item-level release of intercept constraints, one item at a time (largest
+#      summed score statistic first) until the partial scalar model is within
+#      Delta CFI <= .010 and Delta RMSEA <= .015 of the metric model, keeping at
+#      least two fully constrained indicators per factor
+# 04c. Country means on the stratified subsample under three approaches:
+#      observed composite, full scalar model, final partial scalar model
+
+# Diagnostics for the scalar model: (i) score tests of equality constraints and
+# (ii) modification indices for intercepts that are fixed by the identification
+# (with Wu-Estabrook identification, equal intercepts are fixed to zero, so they
+# carry no equality constraint and appear only in the modification indices)
+score_table <- function(fit) {
+  glab <- lavaan::lavInspect(fit, "group.label")
+  pt   <- lavaan::parTable(fit)
+  out  <- list()
+  st <- tryCatch(lavaan::lavTestScore(fit, univariate = TRUE, cumulative = FALSE,
+                                      epc = FALSE)$uni, error = function(e) NULL)
+  if (!is.null(st) && nrow(st) > 0) {
+    i1 <- match(st$lhs, pt$plabel); i2 <- match(st$rhs, pt$plabel)
+    out$score <- data.frame(source = "score_test", item = pt$lhs[i1], op = pt$op[i1],
+                            param = pt$rhs[i1], country = glab[pt$group[i2]],
+                            stat = round(st$X2, 3), epc = NA_real_)
+  }
+  mi <- tryCatch(lavaan::modindices(fit, op = "~1", sort. = FALSE), error = function(e) NULL)
+  if (!is.null(mi) && nrow(mi) > 0) {
+    mi <- mi[mi$lhs %in% cfa_items, ]
+    grp <- if ("group" %in% names(mi)) mi$group else mi$block
+    out$mi <- data.frame(source = "mod_index", item = mi$lhs, op = mi$op, param = "",
+                         country = glab[grp], stat = round(mi$mi, 3),
+                         epc = round(mi$sepc.all, 3))
+  }
+  if (length(out) == 0) return(NULL)
+  rbindlist(out, fill = TRUE)
+}
+
+ok_fit <- function(f) !is.null(f) && isTRUE(lavaan::lavInspect(f, "converged"))
+fm_get <- function(f) { fm <- lavaan::fitMeasures(f); c(cfi = unname(fm["cfi.scaled"]),
+                                                     rmsea = unname(fm["rmsea.scaled"])) }
+
+# Latent factor means and standard errors by country
+latent_means <- function(f, label) {
+  pe <- lavaan::parameterEstimates(f)
+  glab <- lavaan::lavInspect(f, "group.label")
+  m <- pe[pe$op == "~1" & pe$lhs %in% c("DWELL", "AFFORD"), c("lhs", "group", "est", "se")]
+  data.frame(method = label, factor = m$lhs, country = glab[m$group],
+             mean = round(m$est, 4), se = round(m$se, 4))
+}
+
+step04_files <- c("step04_score_tests_scalar.csv", "step04_partial_path.csv",
+                  "step04_country_means.csv", "step04_rank_comparison.csv",
+                  "step04_warnings_log.csv")
+
+if (!force_rerun["step04"] && outputs_exist(step04_files)) {
+  message("Step 04 outputs found - skipped.")
+} else {
+  message("Running step 04 (several model refits; may take a while) ...")
+  inv_fit_tab <- fread(file.path(out_dir, "step03_invariance_fit.csv"))
+  ref_cfi   <- inv_fit_tab[level == "metric", cfi.scaled]
+  ref_rmsea <- inv_fit_tab[level == "metric", rmsea.scaled]
+
+  d_inv <- rec[, c("country", cfa_items)]; d_inv$country <- as.character(d_inv$country)
+  d_rep <- rec[rec$rep_sample %in% TRUE, c("country", cfa_items)]
+  d_rep$country <- as.character(d_rep$country)
+  warn_log <- list()
+
+  # 04a/04b. Sequential release of intercept constraints
+  factor_of <- setNames(c(rep("DWELL", length(cfa_dwell)),
+                          rep("AFFORD", length(c(cfa_energy, cfa_cost)))), cfa_items)
+  freed <- character(0); final_partial <- character(0); path <- list(); iter <- 0
+  repeat {
+    res <- fit_invariance(inv_levels$scalar, d_inv,
+                          partial = if (length(freed)) paste(freed, "~ 1") else "")
+    warn_log[[length(warn_log) + 1]] <- data.frame(stage = paste0("partial_iter_", iter),
+                                                   route = res$route, warnings = res$warn)
+    if (!ok_fit(res$fit)) break
+    fm <- fm_get(res$fit)
+    sc <- tryCatch(score_table(res$fit), error = function(e) NULL)
+    if (iter == 0 && !is.null(sc)) write_out(sc, "step04_score_tests_scalar.csv")
+
+    within <- (ref_cfi - fm["cfi"]) <= 0.010 && (fm["rmsea"] - ref_rmsea) <= 0.015
+    path[[length(path) + 1]] <- data.frame(
+      iteration = iter, freed_items = paste(freed, collapse = ";"), route = res$route,
+      cfi = round(fm["cfi"], 4), rmsea = round(fm["rmsea"], 4),
+      delta_cfi_vs_metric = round(fm["cfi"] - ref_cfi, 4),
+      delta_rmsea_vs_metric = round(fm["rmsea"] - ref_rmsea, 4),
+      criteria_met = within)
+    final_partial <- freed
+    if (within || is.null(sc)) break
+
+    # Candidate items: intercept constraints, factor must keep >= 2 constrained items
+    cand <- sc[!is.na(sc$item) & sc$op == "~1" & sc$item %in% setdiff(cfa_items, freed), ]
+    if (nrow(cand) == 0) { message("No intercept diagnostics available - stopping release."); break }
+    agg  <- cand[, .(X2 = sum(stat, na.rm = TRUE)), by = item]
+    remaining <- table(factor_of[setdiff(cfa_items, freed)])
+    agg <- agg[as.vector(remaining[factor_of[agg$item]]) > 2]
+    if (nrow(agg) == 0) break
+    freed <- c(freed, agg$item[which.max(agg$X2)])
+    iter <- iter + 1
+  }
+  write_out(rbindlist(path), "step04_partial_path.csv")
+
+  # 04c. Country means on the stratified subsample
+  means <- list()
+
+  # Observed composite: mean of pooled z-scores, expressed relative to the first country
+  ref_country <- sort(unique(d_rep$country))[1]
+  for (fct in c("DWELL", "AFFORD")) {
+    its <- names(factor_of)[factor_of == fct]
+    z <- scale(as.matrix(d_rep[, its]))
+    comp <- rowMeans(z, na.rm = TRUE)
+    cm <- tapply(comp, d_rep$country, mean, na.rm = TRUE)
+    sdp <- sd(comp, na.rm = TRUE)
+    means[[length(means) + 1]] <- data.frame(
+      method = "observed_composite", factor = fct, country = names(cm),
+      mean = round((cm - cm[ref_country]) / sdp, 4), se = NA_real_)
+  }
+
+  for (spec in list(list(lab = "scalar_full", part = ""),
+                    list(lab = "scalar_partial",
+                         part = if (length(final_partial)) paste(final_partial, "~ 1") else ""))) {
+    res <- fit_invariance(inv_levels$scalar, d_rep, partial = spec$part)
+    warn_log[[length(warn_log) + 1]] <- data.frame(stage = paste0("rep_", spec$lab),
+                                                   route = res$route, warnings = res$warn)
+    if (ok_fit(res$fit)) means[[length(means) + 1]] <- latent_means(res$fit, spec$lab)
+  }
+
+  mt <- rbindlist(means)
+  mt[, rank := frank(-mean, ties.method = "min"), by = .(method, factor)]
+  write_out(mt, "step04_country_means.csv")
+
+  # Rank agreement between approaches
+  rk <- dcast(mt, factor + country ~ method, value.var = "rank")
+  meth <- setdiff(names(rk), c("factor", "country"))
+  cmp <- list()
+  for (fct in unique(rk$factor)) for (i in seq_along(meth)) for (j in seq_along(meth)) if (i < j) {
+    a <- rk[factor == fct][[meth[i]]]; b <- rk[factor == fct][[meth[j]]]
+    cmp[[length(cmp) + 1]] <- data.frame(
+      factor = fct, method_a = meth[i], method_b = meth[j],
+      spearman = round(suppressWarnings(cor(a, b, method = "spearman", use = "complete.obs")), 3),
+      max_rank_shift = suppressWarnings(max(abs(a - b), na.rm = TRUE)),
+      countries_changing_rank = sum(a != b, na.rm = TRUE))
+  }
+  write_out(rbindlist(cmp), "step04_rank_comparison.csv")
+  write_out(rbindlist(warn_log), "step04_warnings_log.csv")
+}
+
+
+# =============================================================================
+# STEP 05 - Two-stage latent means on the stratified subsample
+# =============================================================================
+# Measurement parameters (loadings, thresholds, intercepts, residual (co)variances)
+# are estimated on the full sample and held fixed; only factor means, variances
+# and covariances are estimated on the stratified subsample. This avoids the
+# weak identification of binary-indicator thresholds in sparse country cells.
+# Route A: fixed-parameter re-estimation; route B: EBM factor scores.
+
+lv_names <- c("DWELL", "AFFORD")
+
+fixed_measurement_fit <- function(fit_full, d_new, equal_var = FALSE) {
+  pt   <- lavaan::parTable(fit_full)
+  glab <- lavaan::lavInspect(fit_full, "group.label")
+  pt   <- pt[pt$op != "==", ]
+  structural <- (pt$op == "~~" & pt$lhs %in% lv_names & pt$rhs %in% lv_names) |
+                (pt$op == "~1" & pt$lhs %in% lv_names)
+  meas <- !structural & pt$op %in% c("=~", "|", "~~", "~1", "~*~")
+  pt$ustart <- ifelse(pt$free == 0 | meas, pt$est, NA)
+  pt$free[meas] <- 0L
+  if (equal_var) {
+    vrow <- pt$op == "~~" & pt$lhs == pt$rhs & pt$lhs %in% lv_names
+    pt$free[vrow] <- 0L; pt$ustart[vrow] <- 1
+  }
+  pt$free[pt$free > 0] <- seq_len(sum(pt$free > 0))
+  pt$label <- ""
+  keep <- c("id", "lhs", "op", "rhs", "user", "block", "group", "free", "ustart", "exo", "label")
+  pt <- as.data.frame(pt)[, intersect(keep, names(pt))]
+  lavaan::lavaan(pt, data = d_new, group = "country", group.label = glab,
+                 ordered = cfa_items, parameterization = "theta",
+                 estimator = "WLSMV", missing = "pairwise")
+}
+
+score_means <- function(fit_full, d_new, label) {
+  glab <- lavaan::lavInspect(fit_full, "group.label")
+  fs <- lavaan::lavPredict(fit_full, newdata = d_new, method = "EBM")
+  if (!is.list(fs)) fs <- list(fs)
+  out <- rbindlist(lapply(seq_along(fs), function(g) {
+    m <- colMeans(fs[[g]], na.rm = TRUE)
+    data.frame(country = glab[g], factor = names(m), mean = unname(m))
+  }))
+  out[, mean := mean - mean[country == glab[1]], by = factor]
+  data.frame(method = label, factor = out$factor, country = out$country,
+             mean = round(out$mean, 4), se = NA_real_)
+}
+
+step05_files <- c("step05_country_means.csv", "step05_rank_comparison.csv",
+                  "step05_warnings_log.csv")
+
+if (!force_rerun["step05"] && outputs_exist(step05_files)) {
+  message("Step 05 outputs found - skipped.")
+} else {
+  message("Running step 05 ...")
+  pp <- fread(file.path(out_dir, "step04_partial_path.csv"))
+  fi <- as.character(pp[.N, freed_items]); if (is.na(fi)) fi <- ""
+  final_items <- strsplit(fi, ";")[[1]]; final_items <- final_items[nzchar(final_items)]
+
+  d_inv <- rec[, c("country", cfa_items)]; d_inv$country <- as.character(d_inv$country)
+  d_rep <- rec[rec$rep_sample %in% TRUE, c("country", cfa_items)]
+  d_rep$country <- as.character(d_rep$country)
+
+  means <- list(); warn_log <- list()
+  prev <- fread(file.path(out_dir, "step04_country_means.csv"))
+  means$observed <- prev[method == "observed_composite", .(method, factor, country, mean, se)]
+
+  specs <- list(scalar_full    = "",
+                scalar_partial = if (length(final_items)) paste(final_items, "~ 1") else "")
+  for (nm in names(specs)) {
+    res <- fit_invariance(inv_levels$scalar, d_inv, partial = specs[[nm]])
+    warn_log[[length(warn_log) + 1]] <- data.frame(stage = paste0(nm, "_fullsample"),
+                                                   route = res$route, warnings = res$warn)
+    if (!ok_fit(res$fit)) next
+    means[[paste0(nm, "_fullsample")]] <- latent_means(res$fit, paste0(nm, "_fullsample"))
+
+    w <- character(0)
+    f2 <- withCallingHandlers(
+      tryCatch(fixed_measurement_fit(res$fit, d_rep), error = function(e) e),
+      warning = function(x) { w <<- c(w, conditionMessage(x)); invokeRestart("muffleWarning") })
+    if (ok_fit(if (inherits(f2, "error")) NULL else f2)) {
+      means[[paste0(nm, "_twostage")]] <- latent_means(f2, paste0(nm, "_twostage"))
+      route <- "A_fixed_parameters"
+    } else {
+      sm <- tryCatch(score_means(res$fit, d_rep, paste0(nm, "_twostage")), error = function(e) NULL)
+      if (!is.null(sm)) means[[paste0(nm, "_twostage")]] <- sm
+      route <- if (is.null(sm)) "failed" else "B_factor_scores"
+      if (inherits(f2, "error")) w <- c(w, conditionMessage(f2))
+    }
+    warn_log[[length(warn_log) + 1]] <- data.frame(stage = paste0(nm, "_twostage"),
+                                                   route = route,
+                                                   warnings = paste(unique(w), collapse = " | "))
+  }
+
+  mt <- rbindlist(means, fill = TRUE)
+  mt[, rank := frank(-mean, ties.method = "min"), by = .(method, factor)]
+  write_out(mt, "step05_country_means.csv")
+
+  rk <- dcast(mt, factor + country ~ method, value.var = "rank")
+  meth <- setdiff(names(rk), c("factor", "country"))
+  cmp <- list()
+  for (fct in unique(rk$factor)) for (i in seq_along(meth)) for (j in seq_along(meth)) if (i < j) {
+    a <- rk[factor == fct][[meth[i]]]; b <- rk[factor == fct][[meth[j]]]
+    cmp[[length(cmp) + 1]] <- data.frame(
+      factor = fct, method_a = meth[i], method_b = meth[j],
+      spearman = round(suppressWarnings(cor(a, b, method = "spearman", use = "complete.obs")), 3),
+      max_rank_shift = suppressWarnings(max(abs(a - b), na.rm = TRUE)),
+      countries_changing_rank = sum(a != b, na.rm = TRUE))
+  }
+  write_out(rbindlist(cmp), "step05_rank_comparison.csv")
+  write_out(rbindlist(warn_log), "step05_warnings_log.csv")
+}
+
+
+# =============================================================================
+# STEP 06 - Sensitivity to factor-variance specification and rank uncertainty
+# =============================================================================
+# 06a. Two-stage latent means re-estimated with factor variances fixed to 1 in
+#      every country (identifies the mean when a country is near the floor of a
+#      binary-indicator factor)
+# 06b. Rank uncertainty: 10,000 draws from the asymptotic sampling distribution
+#      of the latent means; 95% rank intervals and probabilities of top ranks.
+#      Route A: lavaan sampling covariance; route B: independent normal draws
+#      using standard errors only.
+
+rank_uncertainty <- function(f, label, n_draw = 10000, seed = 20251117, exclude = list()) {
+  pt   <- lavaan::parTable(f)
+  glab <- lavaan::lavInspect(f, "group.label")
+  out  <- list()
+  for (fct in lv_names) {
+    rows <- which(pt$op == "~1" & pt$lhs == fct)
+    if (!is.null(exclude[[fct]])) rows <- rows[!glab[pt$group[rows]] %in% exclude[[fct]]]
+    est  <- setNames(pt$est[rows], glab[pt$group[rows]])
+    free_idx <- pt$free[rows]
+    draws <- matrix(rep(est, each = n_draw), nrow = n_draw, dimnames = list(NULL, names(est)))
+    set.seed(seed)
+    V <- tryCatch(lavaan::lavInspect(f, "vcov"), error = function(e) NULL)
+    k <- free_idx > 0
+    route <- "A_vcov"
+    if (!is.null(V) && sum(k) > 0) {
+      Vk <- as.matrix(V)[free_idx[k], free_idx[k], drop = FALSE]
+      draws[, k] <- MASS::mvrnorm(n_draw, mu = est[k], Sigma = Vk)
+    } else {
+      se <- pt$se[rows]
+      draws[, k] <- sapply(which(k), function(j) rnorm(n_draw, est[j], se[j]))
+      route <- "B_independent"
+    }
+    rk <- t(apply(-draws, 1, rank, ties.method = "min"))
+    out[[fct]] <- data.frame(
+      method = label, factor = fct, country = names(est), route = route,
+      rank_point  = rank(-est, ties.method = "min"),
+      rank_q025   = apply(rk, 2, quantile, 0.025),
+      rank_median = apply(rk, 2, median),
+      rank_q975   = apply(rk, 2, quantile, 0.975),
+      p_rank1     = round(colMeans(rk == 1), 3),
+      p_top3      = round(colMeans(rk <= 3), 3))
+  }
+  rbindlist(out)
+}
+
+step06_files <- c("step06_country_means_sensitivity.csv", "step06_rank_uncertainty.csv",
+                  "step06_warnings_log.csv")
+
+if (!force_rerun["step06"] && outputs_exist(step06_files)) {
+  message("Step 06 outputs found - skipped.")
+} else {
+  message("Running step 06 ...")
+  pp <- fread(file.path(out_dir, "step04_partial_path.csv"))
+  fi <- as.character(pp[.N, freed_items]); if (is.na(fi)) fi <- ""
+  final_items <- strsplit(fi, ";")[[1]]; final_items <- final_items[nzchar(final_items)]
+
+  d_inv <- rec[, c("country", cfa_items)]; d_inv$country <- as.character(d_inv$country)
+  d_rep <- rec[rec$rep_sample %in% TRUE, c("country", cfa_items)]
+  d_rep$country <- as.character(d_rep$country)
+
+  specs <- list(scalar_full    = "",
+                scalar_partial = if (length(final_items)) paste(final_items, "~ 1") else "")
+  means <- list(); unc <- list(); warn_log <- list()
+
+  for (nm in names(specs)) {
+    res <- fit_invariance(inv_levels$scalar, d_inv, partial = specs[[nm]])
+    warn_log[[length(warn_log) + 1]] <- data.frame(stage = paste0(nm, "_fullsample"),
+                                                   route = res$route, warnings = res$warn)
+    if (!ok_fit(res$fit)) next
+
+    for (ev in c(FALSE, TRUE)) {
+      lab <- paste0(nm, "_twostage_", ifelse(ev, "equalvar", "freevar"))
+      w <- character(0)
+      f2 <- withCallingHandlers(
+        tryCatch(fixed_measurement_fit(res$fit, d_rep, equal_var = ev), error = function(e) e),
+        warning = function(x) { w <<- c(w, conditionMessage(x)); invokeRestart("muffleWarning") })
+      if (inherits(f2, "error")) { w <- c(w, conditionMessage(f2)); f2 <- NULL }
+      warn_log[[length(warn_log) + 1]] <- data.frame(
+        stage = lab, route = ifelse(ok_fit(f2), "A_fixed_parameters", "failed"),
+        warnings = paste(unique(w), collapse = " | "))
+      if (!ok_fit(f2)) next
+      means[[lab]] <- latent_means(f2, lab)
+      unc[[lab]]   <- tryCatch(rank_uncertainty(f2, lab), error = function(e) NULL)
+    }
+  }
+
+  mt <- rbindlist(means, fill = TRUE)
+  mt[, rank := frank(-mean, ties.method = "min"), by = .(method, factor)]
+  write_out(mt, "step06_country_means_sensitivity.csv")
+  write_out(rbindlist(unc, fill = TRUE), "step06_rank_uncertainty.csv")
+  write_out(rbindlist(warn_log), "step06_warnings_log.csv")
+}
+
+
+# =============================================================================
+# STEP 07 - Robustness of the country rankings
+# =============================================================================
+# 07a. Leave-one-country-out: the partial scalar model is re-estimated without
+#      each country in turn (full sample), latent means are re-estimated on the
+#      stratified subsample (two-stage), and the ranks of the remaining seven
+#      countries are compared with the main solution.
+# 07b. Alternative anchor sets: (i) only the two energy-poverty items released,
+#      (ii) the main set plus the next candidate item (FIN_COMF) released.
+
+twostage_means <- function(partial_items, d_full, d_rep, label, model = inv_model,
+                           levels = inv_levels$scalar) {
+  part <- if (length(partial_items)) paste(partial_items, "~ 1") else ""
+  res  <- fit_invariance(levels, d_full, partial = part, model = model)
+  w <- res$warn
+  if (!ok_fit(res$fit)) return(list(means = NULL, warn = w, route = res$route, route1 = res$route))
+  w2 <- character(0)
+  f2 <- withCallingHandlers(
+    tryCatch(fixed_measurement_fit(res$fit, d_rep), error = function(e) e),
+    warning = function(x) { w2 <<- c(w2, conditionMessage(x)); invokeRestart("muffleWarning") })
+  if (inherits(f2, "error") || !ok_fit(f2)) {
+    sm <- tryCatch(score_means(res$fit, d_rep, label), error = function(e) NULL)
+    return(list(means = sm, warn = paste(c(w, w2), collapse = " | "),
+                route = if (is.null(sm)) "failed" else "B_factor_scores", route1 = res$route))
+  }
+  list(means = latent_means(f2, label), warn = paste(c(w, unique(w2)), collapse = " | "),
+       route = "A_fixed_parameters", route1 = res$route)
+}
+
+compare_ranks <- function(m_new, m_ref) {
+  out <- list()
+  for (fct in lv_names) {
+    a <- m_new[m_new$factor == fct, c("country", "mean")]
+    b <- m_ref[m_ref$factor == fct & m_ref$country %in% a$country, c("country", "mean")]
+    ab <- merge(a, b, by = "country", suffixes = c("_new", "_ref"))
+    ab$rank_new <- rank(-ab$mean_new, ties.method = "min")
+    ab$rank_ref <- rank(-ab$mean_ref, ties.method = "min")
+    out[[fct]] <- data.frame(factor = fct, ab[, c("country", "rank_ref", "rank_new")])
+  }
+  rbindlist(out)
+}
+
+step07_files <- c("step07_loco_ranks.csv", "step07_loco_summary.csv",
+                  "step07_anchor_sensitivity.csv", "step07_warnings_log.csv")
+
+if (!force_rerun["step07"] && outputs_exist(step07_files)) {
+  message("Step 07 outputs found - skipped.")
+} else {
+  message("Running step 07 (long run) ...")
+  pp <- fread(file.path(out_dir, "step04_partial_path.csv"))
+  fi <- as.character(pp[.N, freed_items]); if (is.na(fi)) fi <- ""
+  final_items <- strsplit(fi, ";")[[1]]; final_items <- final_items[nzchar(final_items)]
+
+  ref <- fread(file.path(out_dir, "step05_country_means.csv"))
+  ref <- as.data.frame(ref[method == "scalar_partial_twostage"])
+  # Finland's DWELL mean is not identified (floor of the binary indicators):
+  # it is kept for ranking but flagged in the summary
+  d_inv <- rec[, c("country", cfa_items)]; d_inv$country <- as.character(d_inv$country)
+  d_rep <- rec[rec$rep_sample %in% TRUE, c("country", cfa_items)]
+  d_rep$country <- as.character(d_rep$country)
+  warn_log <- list()
+
+  # 07a. Leave-one-country-out
+  loco <- list()
+  for (cc in sort(unique(d_inv$country))) {
+    lab <- paste0("loco_without_", cc)
+    r <- twostage_means(final_items, d_inv[d_inv$country != cc, ],
+                        d_rep[d_rep$country != cc, ], lab)
+    warn_log[[lab]] <- data.frame(stage = lab, route = r$route, warnings = r$warn)
+    if (is.null(r$means)) next
+    loco[[cc]] <- data.frame(dropped = cc, compare_ranks(as.data.frame(r$means), ref))
+  }
+  loco_tab <- rbindlist(loco)
+  write_out(loco_tab, "step07_loco_ranks.csv")
+  if (nrow(loco_tab) > 0) {
+    loco_sum <- loco_tab[, .(spearman = round(suppressWarnings(cor(rank_ref, rank_new,
+                                                                   method = "spearman")), 3),
+                             max_rank_shift = max(abs(rank_ref - rank_new)),
+                             countries_changing_rank = sum(rank_ref != rank_new)),
+                         by = .(dropped, factor)]
+    write_out(loco_sum, "step07_loco_summary.csv")
+  } else write_out(data.frame(note = "no successful fits"), "step07_loco_summary.csv")
+
+  # 07b. Alternative anchor sets
+  anchor_sets <- list(
+    energy_items_only = intersect(c("AFF_HEAT", "FINBURDEN_ECOST"), cfa_items),
+    main_plus_fin_comf = unique(c(final_items, "FIN_COMF")))
+  anc <- list()
+  for (nm in names(anchor_sets)) {
+    r <- twostage_means(anchor_sets[[nm]], d_inv, d_rep, nm)
+    warn_log[[nm]] <- data.frame(stage = nm, route = r$route, warnings = r$warn)
+    if (is.null(r$means)) next
+    cr <- compare_ranks(as.data.frame(r$means), ref)
+    anc[[nm]] <- data.frame(anchor_set = nm,
+                            released = paste(anchor_sets[[nm]], collapse = ";"),
+                            merge(cr, as.data.frame(r$means)[, c("factor", "country", "mean", "se")],
+                                  by = c("factor", "country")))
+  }
+  write_out(rbindlist(anc, fill = TRUE), "step07_anchor_sensitivity.csv")
+  write_out(rbindlist(warn_log), "step07_warnings_log.csv")
+}
+
+
+# =============================================================================
+# STEP 09 - Additional robustness analyses
+# =============================================================================
+# Every sub-step writes its own files and is skipped when they exist, so an
+# interrupted run resumes where it stopped. The bootstrap (09h) appends one
+# replicate at a time and continues from the last completed replicate.
+# Ranks of the dwelling-defect factor exclude countries listed in
+# `dwell_exclude`, whose latent mean is not identified.
+
+run_log_file <- "step09_run_log.csv"
+log_run <- function(sub, t_start, status, note = "") {
+  row <- data.frame(substep = sub, started = format(t_start, "%Y-%m-%d %H:%M:%S"),
+                    finished = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                    minutes = round(as.numeric(difftime(Sys.time(), t_start, units = "mins")), 1),
+                    status = status, note = note)
+  fwrite(row, file.path(out_dir, run_log_file), append = file.exists(file.path(out_dir, run_log_file)),
+         bom = !file.exists(file.path(out_dir, run_log_file)))
+}
+
+# Ranks with non-identified dwelling-defect means removed
+rank_excl <- function(m) {
+  m <- as.data.table(m)
+  m <- m[!(factor == "DWELL" & country %in% dwell_exclude)]
+  m[, rank := frank(-mean, ties.method = "min"), by = .(method, factor)]
+  m[]
+}
+
+# Spearman correlation and rank shifts of a solution against the main solution
+compare_to_main <- function(m_new, m_ref, label) {
+  a <- rank_excl(m_new)[, .(factor, country, rank_new = rank, mean_new = mean, se_new = se)]
+  b <- rank_excl(m_ref)[, .(factor, country, rank_ref = rank, mean_ref = mean)]
+  ab <- merge(a, b, by = c("factor", "country"))
+  ab[, rank_new := frank(-mean_new, ties.method = "min"), by = factor]
+  ab[, rank_ref := frank(-mean_ref, ties.method = "min"), by = factor]
+  summ <- ab[, .(spearman = round(suppressWarnings(cor(rank_ref, rank_new, method = "spearman")), 3),
+                 max_rank_shift = max(abs(rank_ref - rank_new)),
+                 countries_changing_rank = sum(rank_ref != rank_new)), by = factor]
+  list(detail = data.frame(analysis = label, ab), summary = data.frame(analysis = label, summ))
+}
+
+fit_row <- function(f, label) {
+  fm <- lavaan::fitMeasures(f)
+  cbind(data.frame(model = label), as.data.frame(as.list(round(fm[intersect(fit_names, names(fm))], 4))))
+}
+
+run_step09 <- function(files) force_rerun["step09"] || !outputs_exist(files)
+
+pp9 <- fread(file.path(out_dir, "step04_partial_path.csv"))
+fi9 <- as.character(pp9[.N, freed_items]); if (is.na(fi9)) fi9 <- ""
+final_items <- strsplit(fi9, ";")[[1]]; final_items <- final_items[nzchar(final_items)]
+part_main <- if (length(final_items)) paste(final_items, "~ 1") else ""
+
+# Rows sorted by country so that lavaan's group order equals the sorted labels
+d9_full <- rec[order(rec$country), c("country", cfa_items)]
+d9_full$country <- as.character(d9_full$country)
+d9_rep  <- rec[rec$rep_sample %in% TRUE, c("country", cfa_items)]
+d9_rep  <- d9_rep[order(d9_rep$country), ]; d9_rep$country <- as.character(d9_rep$country)
+
+ref_main <- fread(file.path(out_dir, "step05_country_means.csv"))
+ref_main <- as.data.frame(ref_main[method == "scalar_partial_twostage", .(method, factor, country, mean, se)])
+
+ref_fit <- fread(file.path(out_dir, "step03_invariance_fit.csv"))
+ref_cfi_metric   <- ref_fit[level == "metric", cfi.scaled]
+ref_rmsea_metric <- ref_fit[level == "metric", rmsea.scaled]
+
+# Main full-sample partial scalar fit, re-used by several sub-steps
+main_fit_cache <- NULL
+get_main_fit <- function() {
+  if (is.null(main_fit_cache)) {
+    r <- fit_invariance(inv_levels$scalar, d9_full, partial = part_main)
+    main_fit_cache <<- r
+  }
+  main_fit_cache
+}
+
+# -----------------------------------------------------------------------------
+# 09a. Rank uncertainty with non-identified dwelling-defect means excluded
+# -----------------------------------------------------------------------------
+f09a <- c("step09a_rank_uncertainty.csv")
+if (!run_step09(f09a)) { message("Step 09a outputs found - skipped.") } else {
+  message("Running step 09a ..."); t0 <- Sys.time()
+  out <- list()
+  specs <- list(scalar_full = "", scalar_partial = part_main)
+  for (nm in names(specs)) {
+    res <- if (nm == "scalar_partial") get_main_fit() else
+      fit_invariance(inv_levels$scalar, d9_full, partial = specs[[nm]])
+    if (!ok_fit(res$fit)) next
+    for (ev in c(FALSE, TRUE)) {
+      lab <- paste0(nm, "_twostage_", ifelse(ev, "equalvar", "freevar"))
+      f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(res$fit, d9_rep, equal_var = ev)),
+                     error = function(e) NULL)
+      if (!ok_fit(f2)) next
+      out[[lab]] <- tryCatch(rank_uncertainty(f2, lab, exclude = list(DWELL = dwell_exclude)),
+                             error = function(e) NULL)
+    }
+  }
+  write_out(rbindlist(out, fill = TRUE), f09a[1])
+  log_run("09a", t0, ifelse(length(out) > 0, "ok", "failed"))
+}
+
+# -----------------------------------------------------------------------------
+# 09b. Invariance between the stratified subsample and the remaining respondents
+# -----------------------------------------------------------------------------
+# Within each country, a two-group model (stratified subsample vs remaining
+# respondents) is tested from configural to scalar. Equality supports applying
+# full-sample measurement parameters to the stratified subsample.
+# Route A: two-factor model; route B: affordability items only (used when the
+# dwelling-defect items are too sparse in one of the two parts).
+f09b <- c("step09b_sample_invariance_fit.csv", "step09b_sample_invariance_tests.csv")
+if (!run_step09(f09b)) { message("Step 09b outputs found - skipped.") } else {
+  message("Running step 09b ..."); t0 <- Sys.time()
+  afford_items <- c(cfa_energy, cfa_cost)
+  model_afford <- paste(lhs_rhs("AFFORD", afford_items),
+                        "RED_LIVING_COST_BORROW_MONEY ~~ RED_LIVING_COST_USE_CREDIT",
+                        "FINBURDEN_ECOST ~~ FIN_BURD_HOUSECOST", sep = "\n")
+  fits_b <- list(); tests_b <- list()
+  for (cc in sort(unique(rec$country))) {
+    dd <- rec[rec$country == cc, c("rep_sample", cfa_items)]
+    dd$country <- ifelse(dd$rep_sample %in% TRUE, "representative", "oversample")
+    dd <- dd[order(dd$country), c("country", cfa_items)]
+    run_levels <- function(mdl, dsub) {
+      out <- list()
+      for (lv in names(inv_levels)) {
+        r <- fit_invariance(inv_levels[[lv]], dsub, model = mdl)
+        if (!ok_fit(r$fit)) return(NULL)
+        out[[lv]] <- fit_row(r$fit, lv)
+      }
+      out
+    }
+    route <- "A_two_factor"
+    lv_fit <- run_levels(inv_model, dd)
+    if (is.null(lv_fit)) {
+      route <- "B_affordability_only"
+      lv_fit <- run_levels(model_afford, dd[, c("country", afford_items)])
+    }
+    if (is.null(lv_fit)) { fits_b[[cc]] <- data.frame(country = cc, route = "failed"); next }
+    if (length(lv_fit) == 0) next
+    ft <- rbindlist(lv_fit, fill = TRUE)
+    fits_b[[cc]] <- data.frame(country = cc, route = route, ft)
+    for (k in seq_len(nrow(ft))[-1]) tests_b[[paste(cc, k)]] <- data.frame(
+      country = cc, route = route, restricted = ft$model[k], general = ft$model[k - 1],
+      delta_cfi = round(ft$cfi.scaled[k] - ft$cfi.scaled[k - 1], 4),
+      delta_rmsea = round(ft$rmsea.scaled[k] - ft$rmsea.scaled[k - 1], 4),
+      criteria_met = (ft$cfi.scaled[k - 1] - ft$cfi.scaled[k]) <= 0.010 &&
+                     (ft$rmsea.scaled[k] - ft$rmsea.scaled[k - 1]) <= 0.015)
+  }
+  write_out(rbindlist(fits_b, fill = TRUE), f09b[1])
+  write_out(rbindlist(tests_b, fill = TRUE), f09b[2])
+  log_run("09b", t0, ifelse(length(fits_b) > 0, "ok", "failed"))
+}
+
+# -----------------------------------------------------------------------------
+# 09c. District heating and item functioning (MIMIC models)
+# -----------------------------------------------------------------------------
+# District heating = HEAT_SRC code 7; code 13 ("don't know") = missing.
+# (i)  share of district-heated households by country
+# (ii) per country: AFFORD regressed on district heating, with direct effects of
+#      district heating on the heating-affordability and energy-cost items
+#      (a direct effect indicates different item functioning by heating type)
+# (iii) pooled: country dummies with direct effects on the two items, estimated
+#      without (model A) and with (model B) district-heating direct effects; the
+#      change in Finland's direct effect shows how much district heating accounts
+#      for its item-level deviation.
+# Route A: WLSMV; route B: ULSMV.
+f09c <- c("step09c_district_heating_share.csv", "step09c_mimic_by_country.csv",
+          "step09c_mimic_pooled.csv")
+if (!run_step09(f09c)) { message("Step 09c outputs found - skipped.") } else {
+  message("Running step 09c ..."); t0 <- Sys.time()
+  hs <- suppressWarnings(as.integer(as.character(hi$HEAT_SRC)))
+  rec$dh <- ifelse(is.na(hs) | hs == 13L, NA_integer_, as.integer(hs == 7L))
+
+  share_tab <- function(dt) dt[, .(n = .N, n_valid = sum(!is.na(dh)),
+                                    n_district = sum(dh == 1, na.rm = TRUE),
+                                    pct_district = round(100 * mean(dh, na.rm = TRUE), 2)), by = country]
+  sh  <- data.table(sample = "full", share_tab(as.data.table(rec)))
+  sh2 <- data.table(sample = "representative", share_tab(as.data.table(rec)[rep_sample %in% TRUE]))
+  write_out(rbind(sh, sh2)[order(sample, country)], f09c[1])
+
+  afford_items <- c(cfa_energy, cfa_cost)
+  meas_afford <- paste(lhs_rhs("AFFORD", afford_items),
+                       "RED_LIVING_COST_BORROW_MONEY ~~ RED_LIVING_COST_USE_CREDIT",
+                       "FINBURDEN_ECOST ~~ FIN_BURD_HOUSECOST", sep = "\n")
+  fit_sem2 <- function(model, d, ord) {
+    run <- function(est) tryCatch(suppressWarnings(
+      lavaan::sem(model, data = d, ordered = ord, estimator = est, std.lv = TRUE)),
+      error = function(e) NULL)
+    f <- run("WLSMV"); route <- "A_WLSMV"
+    if (!ok_fit(f)) { f <- run("ULSMV"); route <- "B_ULSMV" }
+    list(fit = f, route = route)
+  }
+  pick <- function(f, rows) {
+    ss <- lavaan::standardizedSolution(f, type = "std.all")
+    ss <- ss[ss$op == "~", c("lhs", "op", "rhs", "est.std", "se", "pvalue", "ci.lower", "ci.upper")]
+    pe <- lavaan::parameterEstimates(f)[, c("lhs", "op", "rhs", "est")]
+    merge(pe[pe$op == "~", ], ss, by = c("lhs", "op", "rhs"))
+  }
+
+  # (ii) per country
+  by_c <- list()
+  for (cc in sort(unique(rec$country))) {
+    dd <- rec[rec$country == cc & !is.na(rec$dh), c("dh", afford_items)]
+    if (sum(dd$dh == 1) < 30 || sum(dd$dh == 0) < 30) {
+      by_c[[cc]] <- data.frame(country = cc, route = "skipped_too_few_district_heated",
+                               n = nrow(dd), n_district = sum(dd$dh == 1)); next
+    }
+    mdl <- paste(meas_afford, "AFFORD ~ dh", "AFF_HEAT ~ dh", "FINBURDEN_ECOST ~ dh", sep = "\n")
+    r <- fit_sem2(mdl, dd, afford_items)
+    if (is.null(r$fit)) { by_c[[cc]] <- data.frame(country = cc, route = "failed"); next }
+    by_c[[cc]] <- data.frame(country = cc, route = r$route, n = nrow(dd),
+                             n_district = sum(dd$dh == 1), pick(r$fit))
+  }
+  write_out(rbindlist(by_c, fill = TRUE), f09c[2])
+
+  # (iii) pooled with country dummies (Belgium = reference)
+  dd <- rec[!is.na(rec$dh), c("country", "dh", afford_items)]
+  cs <- setdiff(sort(unique(dd$country)), sort(unique(dd$country))[1])
+  for (cc in cs) dd[[paste0("c_", cc)]] <- as.integer(dd$country == cc)
+  dum <- paste0("c_", cs)
+  base <- paste(meas_afford,
+                paste("AFFORD ~", paste(c("dh", dum), collapse = " + ")),
+                paste("AFF_HEAT ~", paste(dum, collapse = " + ")),
+                paste("FINBURDEN_ECOST ~", paste(dum, collapse = " + ")), sep = "\n")
+  mods <- list(A_without_dh_direct = base,
+               B_with_dh_direct = paste(base, "AFF_HEAT ~ dh", "FINBURDEN_ECOST ~ dh", sep = "\n"))
+  pooled <- list()
+  for (nm in names(mods)) {
+    r <- fit_sem2(mods[[nm]], dd[, c("dh", dum, afford_items)], afford_items)
+    if (is.null(r$fit)) { pooled[[nm]] <- data.frame(model = nm, route = "failed"); next }
+    pooled[[nm]] <- data.frame(model = nm, route = r$route, n = nrow(dd), pick(r$fit),
+                               cfi = round(lavaan::fitMeasures(r$fit)["cfi.scaled"], 4),
+                               rmsea = round(lavaan::fitMeasures(r$fit)["rmsea.scaled"], 4))
+  }
+  write_out(rbindlist(pooled, fill = TRUE), f09c[3])
+  log_run("09c", t0, "ok")
+}
+
+# -----------------------------------------------------------------------------
+# 09d. Strict invariance: equal residual variances added to the partial model
+# -----------------------------------------------------------------------------
+f09d <- c("step09d_strict_fit.csv", "step09d_strict_ranks.csv")
+if (!run_step09(f09d)) { message("Step 09d outputs found - skipped.") } else {
+  message("Running step 09d ..."); t0 <- Sys.time()
+  strict_levels <- c("thresholds", "loadings", "intercepts", "residuals")
+  rows <- list(); rk <- list()
+  rm <- get_main_fit()
+  if (ok_fit(rm$fit)) rows$partial_scalar <- fit_row(rm$fit, "partial_scalar")
+  rs <- fit_invariance(strict_levels, d9_full, partial = part_main)
+  if (ok_fit(rs$fit)) {
+    rows$partial_strict <- fit_row(rs$fit, "partial_strict")
+    f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(rs$fit, d9_rep)), error = function(e) NULL)
+    if (ok_fit(f2)) {
+      cm <- compare_to_main(latent_means(f2, "partial_strict_twostage"), ref_main, "strict")
+      rk <- list(cm$detail, cm$summary)
+    }
+  }
+  ft <- rbindlist(rows, fill = TRUE)
+  if (nrow(ft) == 2) {
+    ft$delta_cfi   <- c(NA, round(ft$cfi.scaled[2] - ft$cfi.scaled[1], 4))
+    ft$delta_rmsea <- c(NA, round(ft$rmsea.scaled[2] - ft$rmsea.scaled[1], 4))
+  }
+  ft$route <- c(rm$route, rs$route)[seq_len(nrow(ft))]
+  write_out(ft, f09d[1])
+  write_out(if (length(rk)) rbindlist(rk, fill = TRUE) else data.frame(note = "two-stage fit failed"), f09d[2])
+  log_run("09d", t0, ifelse(nrow(ft) == 2, "ok", "partial"))
+}
+
+# -----------------------------------------------------------------------------
+# 09e. Country-specific release of intercepts
+# -----------------------------------------------------------------------------
+# Intercepts of the released items are freed only in countries where the
+# standardised EPC of the full scalar model exceeds `epc_release_cut`.
+# Route A: edit the generated model syntax (free the intercept in the target
+# groups); route B: edit the parameter table of the full scalar fit.
+release_country_specific <- function(d, releases, model = inv_model) {
+  glab <- sort(unique(d$country))
+  ord  <- intersect(cfa_items, names(d))
+  # Route A
+  syn <- tryCatch(as.character(semTools::measEq.syntax(
+    configural.model = model, data = d, ordered = ord, parameterization = "theta",
+    ID.fac = "std.lv", ID.cat = "Wu.Estabrook.2016", group = "country",
+    group.equal = inv_levels$scalar)), error = function(e) NULL)
+  if (!is.null(syn)) {
+    ln <- strsplit(syn, "\n", fixed = TRUE)[[1]]
+    ok_edit <- TRUE
+    for (it in unique(releases$item)) {
+      i <- grep(paste0("^\\s*", it, "\\s*~\\s*c\\("), ln)
+      i <- i[grepl("\\*\\s*1", ln[i])]
+      if (length(i) != 1) { ok_edit <- FALSE; break }
+      cs <- regmatches(ln[i], gregexpr("c\\([^)]*\\)", ln[i]))[[1]]
+      parts <- lapply(cs, function(z) trimws(strsplit(sub("^c\\((.*)\\)$", "\\1", z), ",")[[1]]))
+      if (length(parts) == 0 || any(lengths(parts) != length(glab))) { ok_edit <- FALSE; break }
+      g <- match(releases$country[releases$item == it], glab)
+      g <- g[!is.na(g) & g > 1]
+      parts[[1]][g] <- "NA"                                   # free the intercept
+      if (length(parts) > 1) parts[[2]][g] <- paste0(parts[[2]][g], ".free.g", g)  # break equality label
+      terms <- vapply(parts, function(z) paste0("c(", paste(z, collapse = ", "), ")*1"), character(1))
+      ln[i] <- paste0(it, " ~ ", paste(terms, collapse = " + "))
+    }
+    if (ok_edit) {
+      f <- tryCatch(suppressWarnings(lavaan::cfa(paste(ln, collapse = "\n"), data = d, group = "country",
+                                                 ordered = ord, parameterization = "theta",
+                                                 estimator = "WLSMV", missing = "pairwise")),
+                    error = function(e) NULL)
+      if (ok_fit(f)) return(list(fit = f, route = "A_syntax"))
+    }
+  }
+  # Route B
+  rf <- fit_invariance(inv_levels$scalar, d, model = model)
+  if (!ok_fit(rf$fit)) return(list(fit = NULL, route = "failed"))
+  pt <- lavaan::parTable(rf$fit)
+  gl <- lavaan::lavInspect(rf$fit, "group.label")
+  for (k in seq_len(nrow(releases))) {
+    g <- match(releases$country[k], gl); if (is.na(g) || g == 1) next
+    r <- which(pt$op == "~1" & pt$lhs == releases$item[k] & pt$group == g)
+    if (length(r) != 1) next
+    if (pt$free[r] > 0 && nzchar(pt$plabel[r])) {
+      pt <- pt[!(pt$op == "==" & (pt$lhs == pt$plabel[r] | pt$rhs == pt$plabel[r])), ]
+      r <- which(pt$op == "~1" & pt$lhs == releases$item[k] & pt$group == g)
+      pt$label[r] <- ""
+    }
+    if (pt$free[r] == 0) { pt$free[r] <- max(pt$free) + 1L; pt$ustart[r] <- NA }
+  }
+  fr <- pt$free > 0; pt$free[fr] <- match(pt$free[fr], sort(unique(pt$free[fr])))
+  pt$ustart <- ifelse(pt$free == 0, pt$est, NA)
+  keep <- c("id", "lhs", "op", "rhs", "user", "block", "group", "free", "ustart", "exo", "label", "plabel")
+  pt <- as.data.frame(pt)[, intersect(keep, names(pt))]
+  f <- tryCatch(suppressWarnings(lavaan::lavaan(pt, data = d, group = "country", group.label = gl,
+                                                ordered = ord, parameterization = "theta",
+                                                estimator = "WLSMV", missing = "pairwise")),
+                error = function(e) NULL)
+  list(fit = if (ok_fit(f)) f else NULL, route = if (ok_fit(f)) "B_partable" else "failed")
+}
+
+f09e <- c("step09e_country_specific_releases.csv", "step09e_country_specific_fit.csv",
+          "step09e_country_specific_ranks.csv")
+if (!run_step09(f09e)) { message("Step 09e outputs found - skipped.") } else {
+  message("Running step 09e ..."); t0 <- Sys.time()
+  sc <- fread(file.path(out_dir, "step04_score_tests_scalar.csv"))
+  rel <- sc[source == "mod_index" & item %in% final_items & abs(epc) >= epc_release_cut,
+            .(item, country, epc = round(epc, 3), mi = stat)]
+  rel <- rel[country != sort(unique(d9_full$country))[1]]
+  write_out(rel, f09e[1])
+  r <- release_country_specific(d9_full, as.data.frame(rel))
+  rows <- list(); rk <- list()
+  if (ok_fit(r$fit)) {
+    fr <- fit_row(r$fit, "country_specific_partial")
+    fr$route <- r$route
+    fr$delta_cfi_vs_metric   <- round(fr$cfi.scaled - ref_cfi_metric, 4)
+    fr$delta_rmsea_vs_metric <- round(fr$rmsea.scaled - ref_rmsea_metric, 4)
+    fr$n_released <- nrow(rel)
+    rows <- fr
+    f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(r$fit, d9_rep)), error = function(e) NULL)
+    if (ok_fit(f2)) {
+      cm <- compare_to_main(latent_means(f2, "country_specific_twostage"), ref_main, "country_specific")
+      rk <- list(cm$detail, cm$summary)
+    }
+  } else rows <- data.frame(model = "country_specific_partial", route = "failed")
+  write_out(rows, f09e[2])
+  write_out(if (length(rk)) rbindlist(rk, fill = TRUE) else data.frame(note = "two-stage fit failed"), f09e[3])
+  log_run("09e", t0, r$route)
+}
+
+# -----------------------------------------------------------------------------
+# 09f. Model without the three residual covariances
+# -----------------------------------------------------------------------------
+f09f <- c("step09f_no_rescov_fit.csv", "step09f_no_rescov_ranks.csv")
+if (!run_step09(f09f)) { message("Step 09f outputs found - skipped.") } else {
+  message("Running step 09f ..."); t0 <- Sys.time()
+  model_norc <- cfa_models$M2_two_factor
+  lv <- c(inv_levels, list(partial_scalar = inv_levels$scalar))
+  rows <- list(); fits <- list()
+  for (nm in names(lv)) {
+    r <- fit_invariance(lv[[nm]], d9_full, partial = if (nm == "partial_scalar") part_main else "",
+                        model = model_norc)
+    if (!ok_fit(r$fit)) next
+    fits[[nm]] <- r$fit
+    rows[[nm]] <- cbind(fit_row(r$fit, nm), route = r$route)
+  }
+  ft <- rbindlist(rows, fill = TRUE)
+  if ("metric" %in% ft$model) {
+    ft$delta_cfi_vs_metric   <- round(ft$cfi.scaled - ft$cfi.scaled[ft$model == "metric"], 4)
+    ft$delta_rmsea_vs_metric <- round(ft$rmsea.scaled - ft$rmsea.scaled[ft$model == "metric"], 4)
+  }
+  write_out(ft, f09f[1])
+  rk <- list()
+  if (!is.null(fits$partial_scalar)) {
+    f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(fits$partial_scalar, d9_rep)),
+                   error = function(e) NULL)
+    if (ok_fit(f2)) {
+      cm <- compare_to_main(latent_means(f2, "no_rescov_twostage"), ref_main, "no_residual_covariances")
+      rk <- list(cm$detail, cm$summary)
+    }
+  }
+  write_out(if (length(rk)) rbindlist(rk, fill = TRUE) else data.frame(note = "two-stage fit failed"), f09f[2])
+  log_run("09f", t0, ifelse(length(rk) > 0, "ok", "partial"))
+}
+
+# -----------------------------------------------------------------------------
+# 09g. Sample without the late top-up fieldwork
+# -----------------------------------------------------------------------------
+f09g <- c("step09g_topup_counts.csv", "step09g_no_topup_ranks.csv")
+if (!run_step09(f09g)) { message("Step 09g outputs found - skipped.") } else {
+  message("Running step 09g ..."); t0 <- Sys.time()
+  sd_raw <- fix_utf8(as.character(hi$StartDate))
+  sdate  <- suppressWarnings(as.Date(substr(sd_raw, 1, 10)))
+  if (all(is.na(sdate))) sdate <- suppressWarnings(as.Date(sd_raw, tryFormats = c("%d/%m/%Y", "%m/%d/%Y")))
+  rec$topup <- !is.na(sdate) & sdate >= as.Date(topup_from)
+  cnt <- as.data.table(rec)[, .(n = .N, n_topup = sum(topup), pct_topup = round(100 * mean(topup), 2),
+                                n_rep_topup = sum(topup & rep_sample %in% TRUE),
+                                first_date = as.character(min(sdate[!is.na(sdate)])),
+                                last_date = as.character(max(sdate[!is.na(sdate)]))), by = country]
+  write_out(cnt[order(country)], f09g[1])
+  if (sum(rec$topup) == 0) {
+    write_out(data.frame(note = "no top-up interviews identified"), f09g[2])
+    log_run("09g", t0, "no_topup")
+  } else {
+    keep <- !rec$topup
+    dfull <- rec[keep, c("country", cfa_items)]; dfull <- dfull[order(dfull$country), ]
+    drep  <- rec[keep & rec$rep_sample %in% TRUE, c("country", cfa_items)]; drep <- drep[order(drep$country), ]
+    r <- twostage_means(final_items, dfull, drep, "no_topup_twostage")
+    if (!is.null(r$means)) {
+      cm <- compare_to_main(as.data.frame(r$means), ref_main, "without_topup")
+      write_out(rbindlist(list(cm$detail, cm$summary), fill = TRUE), f09g[2])
+    } else write_out(data.frame(note = "fit failed"), f09g[2])
+    log_run("09g", t0, paste(r$route1, r$route, sep = "/"))
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 09h. Bootstrap of the two-stage procedure (long run, resumable)
+# -----------------------------------------------------------------------------
+# Respondents are resampled with replacement within each country from the full
+# sample; each resampled respondent keeps its subsample flag. Both
+# stages (partial scalar model on the resample; latent means on its
+# stratified part) are re-estimated, so the uncertainty of the measurement
+# parameters is carried into the latent means and ranks. Replicates are
+# appended to the draws file one at a time; re-running continues the series.
+f09h_draws <- "step09h_bootstrap_draws.csv"
+f09h_fail  <- "step09h_bootstrap_failures.csv"
+f09h_sum   <- c("step09h_bootstrap_summary.csv", "step09h_bootstrap_ranks.csv")
+boot_path  <- file.path(out_dir, f09h_draws)
+done_b <- if (file.exists(boot_path)) unique(fread(boot_path)$replicate) else integer(0)
+if (file.exists(file.path(out_dir, f09h_fail)))
+  done_b <- union(done_b, unique(fread(file.path(out_dir, f09h_fail))$replicate))
+todo_b <- setdiff(seq_len(boot_B), done_b)
+
+if (length(todo_b) == 0 && outputs_exist(f09h_sum)) {
+  message("Step 09h complete - skipped.")
+} else {
+  message("Running step 09h: ", length(todo_b), " replicates to go (long run) ...")
+  t0 <- Sys.time()
+  idx_by_c <- split(seq_len(nrow(rec)), rec$country)
+  for (b in todo_b) {
+    if (as.numeric(difftime(Sys.time(), t0, units = "hours")) > boot_max_hours) {
+      message("Time budget reached; re-run the script to continue the bootstrap."); break
+    }
+    set.seed(boot_seed + b)
+    idx <- unlist(lapply(idx_by_c, function(ix) ix[sample.int(length(ix), length(ix), replace = TRUE)]),
+                  use.names = FALSE)
+    db <- rec[idx, ]
+    dfull <- db[order(db$country), c("country", cfa_items)]
+    drep  <- db[db$rep_sample %in% TRUE, c("country", cfa_items)]; drep <- drep[order(drep$country), ]
+    r <- tryCatch(twostage_means(final_items, dfull, drep, "boot"),
+                  error = function(e) list(means = NULL, route = "error", warn = conditionMessage(e)))
+    # Accept only replicates estimated with the main routes (identification
+    # route A for stage 1, fixed-parameter route A for stage 2)
+    if (!is.null(r$means) && identical(r$route, "A_fixed_parameters") &&
+        identical(r$route1, "A_measEq")) {
+      x <- as.data.frame(r$means)[, c("factor", "country", "mean")]
+      x <- data.frame(replicate = b, x)
+      fwrite(x, boot_path, append = file.exists(boot_path))
+    } else {
+      fp <- file.path(out_dir, f09h_fail)
+      fwrite(data.frame(replicate = b, route = paste(r$route1, r$route, sep = "/"),
+                        note = substr(as.character(r$warn), 1, 300)), fp, append = file.exists(fp))
+    }
+    if (b %% 10 == 0) message("  bootstrap replicate ", b, " of ", boot_B, " (",
+                              round(as.numeric(difftime(Sys.time(), t0, units = "hours")), 2), " h)")
+  }
+
+  # Summary (written whenever at least 20 replicates are available)
+  if (file.exists(boot_path)) {
+    bd <- fread(boot_path)
+    nb <- length(unique(bd$replicate))
+    if (nb >= 20) {
+      bd <- bd[!(factor == "DWELL" & country %in% dwell_exclude)]
+      main <- as.data.table(ref_main)[, .(factor, country, mean_main = mean, se_model = se)]
+      sm <- bd[, .(n_replicates = .N, boot_mean = round(mean(mean), 4), boot_se = round(sd(mean), 4),
+                   ci_lo = round(quantile(mean, 0.025), 4), ci_hi = round(quantile(mean, 0.975), 4)),
+               by = .(factor, country)]
+      sm <- merge(main, sm, by = c("factor", "country"))
+      sm[, se_ratio_boot_to_model := ifelse(se_model > 0, round(boot_se / se_model, 2), NA_real_)]
+      write_out(sm, f09h_sum[1])
+      bd[, rank := frank(-mean, ties.method = "min"), by = .(replicate, factor)]
+      rr <- bd[, .(rank_q025 = quantile(rank, 0.025), rank_median = median(rank),
+                   rank_q975 = quantile(rank, 0.975), p_rank1 = round(mean(rank == 1), 3),
+                   p_top3 = round(mean(rank <= 3), 3), n_replicates = .N), by = .(factor, country)]
+      write_out(rr[order(factor, rank_median)], f09h_sum[2])
+    }
+  }
+  log_run("09h", t0, paste0("replicates_total=", if (file.exists(boot_path))
+    length(unique(fread(boot_path)$replicate)) else 0))
+}
+
+
+# =============================================================================
+# STEP 10 - Selection uncertainty and further sensitivity analyses
+# =============================================================================
+# 10a Bootstrap in which the whole intercept-release procedure is repeated in
+#     every replicate (selection stability; latent means and ranks under the
+#     full scalar model and under the replicate's own partial scalar model).
+#     Same resamples and the same number of replicates as step 09h.
+#     Long run, resumable: replicates are appended one at a time.
+# 10b Country-specific release with alternative |sEPC| cut-offs (0.15, 0.30)
+# 10c One-stage partial scalar model estimated on the stratified subsample
+
+# Release procedure used in step 04, applied to any data set. Intercept
+# diagnostics come from modification indices (with Wu-Estabrook identification
+# the equal intercepts carry no equality constraint, so score tests add nothing
+# for them). Route A: modification indices of the current fit; route B: none
+# available -> stop releasing (recorded).
+select_partial <- function(d) {
+  factor_of <- setNames(c(rep("DWELL", length(cfa_dwell)),
+                          rep("AFFORD", length(c(cfa_energy, cfa_cost)))), cfa_items)
+  rm <- fit_invariance(inv_levels$metric, d)
+  if (!ok_fit(rm$fit) || !identical(rm$route, "A_measEq")) return(list(ok = FALSE, why = "metric"))
+  ref <- fm_get(rm$fit)
+  freed <- character(0); fits <- list(); iter <- 0; within <- FALSE
+  repeat {
+    res <- fit_invariance(inv_levels$scalar, d,
+                          partial = if (length(freed)) paste(freed, "~ 1") else "")
+    if (!ok_fit(res$fit) || !identical(res$route, "A_measEq"))
+      return(list(ok = FALSE, why = paste0("scalar_iter_", iter)))
+    fits[[as.character(iter)]] <- res$fit
+    fm <- fm_get(res$fit)
+    within <- (ref["cfi"] - fm["cfi"]) <= 0.010 && (fm["rmsea"] - ref["rmsea"]) <= 0.015
+    if (within) break
+    mi <- tryCatch(lavaan::modindices(res$fit, op = "~1", sort. = FALSE), error = function(e) NULL)
+    if (is.null(mi) || nrow(mi) == 0) break
+    mi <- as.data.table(mi[mi$lhs %in% setdiff(cfa_items, freed), c("lhs", "mi")])
+    agg <- mi[, .(X2 = sum(mi, na.rm = TRUE)), by = lhs]
+    remaining <- table(factor_of[setdiff(cfa_items, freed)])
+    agg <- agg[as.vector(remaining[factor_of[agg$lhs]]) > 2]
+    if (nrow(agg) == 0) break
+    freed <- c(freed, agg$lhs[which.max(agg$X2)])
+    iter <- iter + 1
+    if (iter > 8) break
+  }
+  list(ok = TRUE, freed = freed, criteria_met = within, full = fits[["0"]],
+       partial = fits[[length(fits)]])
+}
+
+# -----------------------------------------------------------------------------
+# 10b. Country-specific release with alternative cut-offs
+# -----------------------------------------------------------------------------
+f10b <- c("step10b_cutoff_fit.csv", "step10b_cutoff_ranks.csv")
+if (!(force_rerun["step10"] || !outputs_exist(f10b))) { message("Step 10b outputs found - skipped.") } else {
+  message("Running step 10b ..."); t0 <- Sys.time()
+  sc <- fread(file.path(out_dir, "step04_score_tests_scalar.csv"))
+  fits <- list(); rks <- list()
+  for (cut in c(0.15, 0.20, 0.30)) {
+    rel <- sc[source == "mod_index" & item %in% final_items & abs(epc) >= cut, .(item, country)]
+    rel <- rel[country != sort(unique(d9_full$country))[1]]
+    lab <- paste0("cutoff_", formatC(cut, format = "f", digits = 2))
+    r <- release_country_specific(d9_full, as.data.frame(rel))
+    if (!ok_fit(r$fit)) { fits[[lab]] <- data.frame(model = lab, route = "failed", n_released = nrow(rel)); next }
+    fr <- fit_row(r$fit, lab); fr$route <- r$route; fr$n_released <- nrow(rel)
+    fr$pairs <- paste(paste(rel$item, rel$country, sep = ":"), collapse = ";")
+    fr$delta_cfi_vs_metric   <- round(fr$cfi.scaled - ref_cfi_metric, 4)
+    fr$delta_rmsea_vs_metric <- round(fr$rmsea.scaled - ref_rmsea_metric, 4)
+    fits[[lab]] <- fr
+    f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(r$fit, d9_rep)), error = function(e) NULL)
+    if (ok_fit(f2)) {
+      cm <- compare_to_main(latent_means(f2, lab), ref_main, lab)
+      rks[[lab]] <- rbindlist(list(cm$detail, cm$summary), fill = TRUE)
+    }
+  }
+  write_out(rbindlist(fits, fill = TRUE), f10b[1])
+  write_out(if (length(rks)) rbindlist(rks, fill = TRUE) else data.frame(note = "failed"), f10b[2])
+  log_run("10b", t0, "ok")
+}
+
+# -----------------------------------------------------------------------------
+# 10c. One-stage partial scalar model on the stratified subsample
+# -----------------------------------------------------------------------------
+# Route A: two-factor model; route B: affordability items only (if the sparse
+# dwelling-defect items prevent convergence in the smaller sample).
+f10c <- c("step10c_onestage_fit.csv", "step10c_onestage_ranks.csv")
+if (!(force_rerun["step10"] || !outputs_exist(f10c))) { message("Step 10c outputs found - skipped.") } else {
+  message("Running step 10c ..."); t0 <- Sys.time()
+  afford_items <- c(cfa_energy, cfa_cost)
+  model_afford <- paste(lhs_rhs("AFFORD", afford_items),
+                        "RED_LIVING_COST_BORROW_MONEY ~~ RED_LIVING_COST_USE_CREDIT",
+                        "FINBURDEN_ECOST ~~ FIN_BURD_HOUSECOST", sep = "\n")
+  part_aff <- if (length(intersect(final_items, afford_items)))
+    paste(intersect(final_items, afford_items), "~ 1") else ""
+  runs <- list(A_two_factor = list(model = inv_model, d = d9_rep, part = part_main),
+               B_affordability_only = list(model = model_afford, d = d9_rep[, c("country", afford_items)],
+                                           part = part_aff))
+  fits <- list(); rks <- list()
+  for (nm in names(runs)) {
+    r <- fit_invariance(inv_levels$scalar, runs[[nm]]$d, partial = runs[[nm]]$part, model = runs[[nm]]$model)
+    # The lavaan fallback of fit_invariance cannot free intercepts of ordinal
+    # items; in that case the release is applied by editing the model syntax
+    if (!ok_fit(r$fit) || !identical(r$route, "A_measEq")) {
+      its <- trimws(sub("~\\s*1$", "", runs[[nm]]$part)); its <- its[nzchar(its)]
+      rel <- expand.grid(item = its, country = sort(unique(runs[[nm]]$d$country))[-1],
+                         stringsAsFactors = FALSE)
+      r2 <- release_country_specific(runs[[nm]]$d, rel, model = runs[[nm]]$model)
+      r <- list(fit = r2$fit, route = paste0("release_by_", r2$route))
+    }
+    if (!ok_fit(r$fit)) { fits[[nm]] <- data.frame(model = nm, route = "failed"); next }
+    fr <- fit_row(r$fit, nm); fr$route <- r$route; fits[[nm]] <- fr
+    lm1 <- latent_means(r$fit, paste0("onestage_", nm))
+    ref_use <- ref_main[ref_main$factor %in% unique(lm1$factor), ]
+    cm <- compare_to_main(lm1, ref_use, paste0("onestage_", nm))
+    rks[[nm]] <- rbindlist(list(cm$detail, cm$summary), fill = TRUE)
+  }
+  write_out(rbindlist(fits, fill = TRUE), f10c[1])
+  write_out(if (length(rks)) rbindlist(rks, fill = TRUE) else data.frame(note = "failed"), f10c[2])
+  log_run("10c", t0, "ok")
+}
+
+
+# -----------------------------------------------------------------------------
+# 10a. Bootstrap repeating the intercept selection (run last: long)
+# -----------------------------------------------------------------------------
+f10a_draws <- "step10a_boot_select_draws.csv"
+f10a_sel   <- "step10a_boot_select_items.csv"
+f10a_fail  <- "step10a_boot_select_failures.csv"
+f10a_sum   <- c("step10a_selection_frequency.csv", "step10a_boot_select_summary.csv",
+                "step10a_boot_select_ranks.csv")
+p10a <- file.path(out_dir, f10a_draws); p10s <- file.path(out_dir, f10a_sel)
+p10f <- file.path(out_dir, f10a_fail)
+
+done10 <- integer(0)
+if (file.exists(p10s)) done10 <- unique(fread(p10s)$replicate)
+if (file.exists(p10f)) done10 <- union(done10, unique(fread(p10f)$replicate))
+todo10 <- setdiff(seq_len(boot_B), done10)
+
+if (length(todo10) == 0 && outputs_exist(f10a_sum)) {
+  message("Step 10a complete - skipped.")
+} else {
+  message("Running step 10a: ", length(todo10), " replicates to go (long run) ...")
+  t0 <- Sys.time()
+  idx_by_c <- split(seq_len(nrow(rec)), rec$country)
+  for (b in todo10) {
+    if (as.numeric(difftime(Sys.time(), t0, units = "hours")) > boot_max_hours) {
+      message("Time budget reached; re-run the script to continue step 10a."); break
+    }
+    set.seed(boot_seed + b)                       # identical resamples to step 09h
+    idx <- unlist(lapply(idx_by_c, function(ix) ix[sample.int(length(ix), length(ix), replace = TRUE)]),
+                  use.names = FALSE)
+    db <- rec[idx, ]
+    dfull <- db[order(db$country), c("country", cfa_items)]
+    drep  <- db[db$rep_sample %in% TRUE, c("country", cfa_items)]; drep <- drep[order(drep$country), ]
+    s <- tryCatch(select_partial(dfull), error = function(e) list(ok = FALSE, why = conditionMessage(e)))
+    if (!isTRUE(s$ok)) {
+      fwrite(data.frame(replicate = b, stage = "selection", note = substr(as.character(s$why), 1, 200)),
+             p10f, append = file.exists(p10f)); next
+    }
+    out <- list()
+    for (nm in c("full", "partial")) {
+      f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(s[[nm]], drep)), error = function(e) NULL)
+      if (ok_fit(f2)) out[[nm]] <- data.frame(replicate = b,
+                                              latent_means(f2, paste0("scalar_", nm))[, c("method", "factor", "country", "mean")])
+    }
+    if (length(out) < 2) {
+      fwrite(data.frame(replicate = b, stage = "second_stage", note = "not converged"),
+             p10f, append = file.exists(p10f)); next
+    }
+    fwrite(rbindlist(out), p10a, append = file.exists(p10a))
+    fwrite(data.frame(replicate = b, freed_items = paste(sort(s$freed), collapse = ";"),
+                      release_order = paste(s$freed, collapse = ";"), n_released = length(s$freed),
+                      criteria_met = s$criteria_met), p10s, append = file.exists(p10s))
+    if (b %% 10 == 0) message("  step 10a replicate ", b, " of ", boot_B, " (",
+                              round(as.numeric(difftime(Sys.time(), t0, units = "hours")), 2), " h)")
+  }
+
+  if (file.exists(p10s) && file.exists(p10a)) {
+    sel <- fread(p10s); nb <- nrow(sel)
+    if (nb >= 20) {
+      main_set <- paste(sort(final_items), collapse = ";")
+      it_freq <- rbindlist(lapply(cfa_items, function(it)
+        data.frame(type = "item", value = it,
+                   share = round(mean(grepl(paste0("(^|;)", it, "(;|$)"), sel$freed_items)), 3))))
+      set_freq <- sel[, .(share = round(.N / nb, 3)), by = .(value = freed_items)][order(-share)]
+      set_freq[, type := ifelse(value == main_set, "item_set (main)", "item_set")]
+      nrel <- sel[, .(share = round(.N / nb, 3)), by = .(value = as.character(n_released))]
+      nrel[, type := "number_released"]
+      write_out(rbind(data.frame(it_freq), data.frame(set_freq)[, c("type", "value", "share")],
+                      data.frame(nrel)[, c("type", "value", "share")],
+                      data.frame(type = "replicates", value = "successful", share = nb)), f10a_sum[1])
+
+      bd <- fread(p10a)
+      bd <- bd[!(factor == "DWELL" & country %in% dwell_exclude)]
+      sm <- bd[, .(n_replicates = .N, boot_mean = round(mean(mean), 4), boot_se = round(sd(mean), 4),
+                   ci_lo = round(quantile(mean, 0.025), 4), ci_hi = round(quantile(mean, 0.975), 4)),
+               by = .(method, factor, country)]
+      write_out(sm[order(method, factor, -boot_mean)], f10a_sum[2])
+      bd[, rank := frank(-mean, ties.method = "min"), by = .(replicate, method, factor)]
+      rr <- bd[, .(rank_q025 = quantile(rank, 0.025), rank_median = median(rank),
+                   rank_q975 = quantile(rank, 0.975), p_rank1 = round(mean(rank == 1), 3),
+                   p_top3 = round(mean(rank <= 3), 3), n_replicates = .N),
+               by = .(method, factor, country)]
+      write_out(rr[order(method, factor, rank_median)], f10a_sum[3])
+    }
+  }
+  log_run("10a", t0, paste0("replicates_ok=", if (file.exists(p10s)) nrow(fread(p10s)) else 0))
+}
+
+# =============================================================================
+# STEP 11 - Bootstrap convergence, fit of the partial models, excluded items
+# =============================================================================
+# 11b Fit of every partial scalar model on the release path (chi-square, df,
+#     CFI, TLI, RMSEA, SRMR and scaled chi-square differences)
+# 11c Country-specific loadings of the items excluded during model building
+#     (cooling affordability, lacking heating equipment, third mould item)
+# 11a Bootstrap repeating the intercept selection for the affordability factor
+#     alone. The rare dwelling-defect categories caused most failed replicates
+#     in step 10a; this run uses the same resamples (same seeds, same number of
+#     replicates) without the dwelling-defect factor. Long run, resumable.
+
+run_step11 <- function(files) force_rerun["step11"] || !outputs_exist(files)
+
+afford11 <- c(cfa_energy, cfa_cost)
+model_afford11 <- paste(lhs_rhs("AFFORD", afford11),
+                        "RED_LIVING_COST_BORROW_MONEY ~~ RED_LIVING_COST_USE_CREDIT",
+                        "FINBURDEN_ECOST ~~ FIN_BURD_HOUSECOST", sep = "\n")
+
+# Partial scalar fit with the intercepts of `freed` released in all countries.
+# Route A: measEq.syntax with group.partial; route B: syntax edit that frees
+# the intercepts directly (the plain lavaan fallback cannot free them).
+fit_partial_m <- function(d, model, freed) {
+  part <- if (length(freed)) paste(freed, "~ 1") else ""
+  r <- fit_invariance(inv_levels$scalar, d, partial = part, model = model)
+  if (ok_fit(r$fit) && (length(freed) == 0 || identical(r$route, "A_measEq")))
+    return(list(fit = r$fit, route = r$route))
+  if (length(freed) == 0) return(list(fit = NULL, route = "failed"))
+  rel <- expand.grid(item = freed, country = sort(unique(d$country))[-1], stringsAsFactors = FALSE)
+  r2 <- release_country_specific(d, rel, model = model)
+  list(fit = r2$fit, route = paste0("release_by_", r2$route))
+}
+
+# Release procedure of step 04 for any model and item set
+select_partial_m <- function(d, model, items, max_iter = 8) {
+  rm <- fit_invariance(inv_levels$metric, d, model = model)
+  if (!ok_fit(rm$fit)) return(list(ok = FALSE, why = "metric"))
+  ref <- fm_get(rm$fit)
+  freed <- character(0); fits <- list(); iter <- 0; within <- FALSE; routes <- character(0)
+  repeat {
+    res <- fit_partial_m(d, model, freed)
+    if (!ok_fit(res$fit)) return(list(ok = FALSE, why = paste0("scalar_iter_", iter)))
+    fits[[as.character(iter)]] <- res$fit; routes <- c(routes, res$route)
+    fm <- fm_get(res$fit)
+    within <- (ref["cfi"] - fm["cfi"]) <= 0.010 && (fm["rmsea"] - ref["rmsea"]) <= 0.015
+    if (within) break
+    mi <- tryCatch(lavaan::modindices(res$fit, op = "~1", sort. = FALSE), error = function(e) NULL)
+    if (is.null(mi) || nrow(mi) == 0) break
+    mi <- as.data.table(mi[mi$lhs %in% setdiff(items, freed), c("lhs", "mi")])
+    if (nrow(mi) == 0 || length(setdiff(items, freed)) <= 2) break
+    agg <- mi[, .(X2 = sum(mi, na.rm = TRUE)), by = lhs]
+    freed <- c(freed, agg$lhs[which.max(agg$X2)])
+    iter <- iter + 1
+    if (iter > max_iter) break
+  }
+  list(ok = TRUE, freed = freed, criteria_met = within, full = fits[["0"]],
+       partial = fits[[length(fits)]], routes = paste(routes, collapse = ";"))
+}
+
+# Second-stage means. Route A: measurement parameters fixed at the full-sample
+# estimates; route B: EBM factor scores of the full-sample model.
+second_stage11 <- function(fit_full, d_new, label) {
+  f2 <- tryCatch(suppressWarnings(fixed_measurement_fit(fit_full, d_new)), error = function(e) NULL)
+  if (ok_fit(f2)) return(cbind(latent_means(f2, label), stage2 = "A_fixed_parameters"))
+  sm <- tryCatch(suppressWarnings(score_means(fit_full, d_new, label)), error = function(e) NULL)
+  if (!is.null(sm) && nrow(sm) > 0) return(cbind(sm, stage2 = "B_factor_scores"))
+  NULL
+}
+
+d11_full <- d9_full[, c("country", afford11)]
+d11_rep  <- d9_rep[, c("country", afford11)]
+
+# -----------------------------------------------------------------------------
+# 11b. Fit of the partial scalar models on the release path
+# -----------------------------------------------------------------------------
+f11b <- c("step11b_partial_fit.csv")
+if (!run_step11(f11b)) { message("Step 11b outputs found - skipped.") } else {
+  message("Running step 11b ..."); t0 <- Sys.time()
+  rm_fit <- fit_invariance(inv_levels$metric, d9_full)
+  steps <- c("", strsplit(as.character(pp9[.N, freed_items]), ";")[[1]])
+  steps <- steps[!is.na(steps)]
+  rows <- list(); prev <- rm_fit$fit; prev_lab <- "metric"
+  if (ok_fit(rm_fit$fit)) { fr <- fit_row(rm_fit$fit, "metric"); fr$route <- rm_fit$route; rows[["metric"]] <- fr }
+  for (k in seq_along(steps)) {
+    freed <- steps[seq_len(k)]; freed <- freed[nzchar(freed)]
+    lab <- if (length(freed)) paste0("partial: ", paste(freed, collapse = " + ")) else "full scalar"
+    r <- fit_partial_m(d9_full, inv_model, freed)
+    if (!ok_fit(r$fit)) { rows[[lab]] <- data.frame(model = lab, route = "failed"); next }
+    fr <- fit_row(r$fit, lab); fr$route <- r$route
+    for (cmp in list(list(f = rm_fit$fit, nm = "vs_metric"), list(f = prev, nm = "vs_previous"))) {
+      lrt <- if (ok_fit(cmp$f)) tryCatch(lavaan::lavTestLRT(r$fit, cmp$f), error = function(e) NULL) else NULL
+      fr[[paste0("chisq_diff_", cmp$nm)]] <- if (is.null(lrt)) NA else round(lrt[2, "Chisq diff"], 3)
+      fr[[paste0("df_diff_", cmp$nm)]]    <- if (is.null(lrt)) NA else lrt[2, "Df diff"]
+      fr[[paste0("p_", cmp$nm)]]          <- if (is.null(lrt)) NA else signif(lrt[2, "Pr(>Chisq)"], 4)
+    }
+    fr$compared_with_previous <- prev_lab
+    if (ok_fit(rm_fit$fit)) {
+      fm0 <- lavaan::fitMeasures(rm_fit$fit)
+      fr$delta_cfi_vs_metric   <- round(fr$cfi.scaled - fm0[["cfi.scaled"]], 4)
+      fr$delta_rmsea_vs_metric <- round(fr$rmsea.scaled - fm0[["rmsea.scaled"]], 4)
+      fr$delta_srmr_vs_metric  <- round(fr$srmr - fm0[["srmr"]], 4)
+    }
+    rows[[lab]] <- fr; prev <- r$fit; prev_lab <- lab
+  }
+  write_out(rbindlist(rows, fill = TRUE), f11b)
+  log_run("11b", t0, "ok")
+}
+
+# -----------------------------------------------------------------------------
+# 11c. Loadings of the items excluded during model building
+# -----------------------------------------------------------------------------
+# Each excluded item is added to the final two-factor model (with its three
+# residual covariances), one at a time, in every country and in the pooled
+# sample. Route A: WLSMV; route B: ULSMV.
+f11c <- c("step11c_excluded_loadings.csv", "step11c_excluded_fit.csv")
+if (!run_step11(f11c)) { message("Step 11c outputs found - skipped.") } else {
+  message("Running step 11c ..."); t0 <- Sys.time()
+  extra <- list(base = "",
+                COMF_COOL = "AFFORD =~ COMF_COOL",
+                LACK_ENERGY_APP_HEATING = "AFFORD =~ LACK_ENERGY_APP_HEATING",
+                DP_MOULD3 = "DWELL =~ DP_MOULD3")
+  all_items <- c(cfa_items, "COMF_COOL", "LACK_ENERGY_APP_HEATING", "DP_MOULD3")
+  fit_one <- function(model, d) {
+    warn <- character(0)
+    run <- function(est) withCallingHandlers(
+      tryCatch(lavaan::cfa(model, data = d, ordered = intersect(all_items, names(d)), estimator = est,
+                           std.lv = TRUE, missing = "pairwise"), error = function(e) e),
+      warning = function(w) { warn <<- c(warn, conditionMessage(w)); invokeRestart("muffleWarning") })
+    conv <- function(f) !inherits(f, "error") && isTRUE(lavaan::lavInspect(f, "converged"))
+    f <- run("WLSMV"); route <- "A_WLSMV"
+    if (!conv(f)) { warn <- character(0); f <- run("ULSMV"); route <- "B_ULSMV" }
+    if (!conv(f)) return(list(fit = NULL, route = "failed",
+                              warn = if (inherits(f, "error")) conditionMessage(f) else "not converged"))
+    list(fit = f, route = route, warn = paste(unique(warn), collapse = " | "))
+  }
+  ld_rows <- list(); fit_rows <- list()
+  for (g in c(sort(unique(rec$country)), "POOLED")) {
+    for (nm in names(extra)) {
+      its <- if (nm == "base") cfa_items else c(cfa_items, nm)
+      d <- rec[, c("country", its)]
+      if (g != "POOLED") d <- d[d$country == g, ]
+      d <- d[, its]
+      n_endorsed <- if (nm == "base") NA else sum(d[[nm]] > 0, na.rm = TRUE)
+      mdl <- if (nzchar(extra[[nm]])) paste(inv_model, extra[[nm]], sep = "\n") else inv_model
+      r <- fit_one(mdl, d)
+      key <- data.frame(country = g, variant = nm, n = nrow(d), n_endorsed_extra = n_endorsed,
+                        route = r$route)
+      if (is.null(r$fit)) { fit_rows[[length(fit_rows) + 1]] <- cbind(key, warnings = substr(r$warn, 1, 200)); next }
+      fm <- lavaan::fitMeasures(r$fit)
+      fit_rows[[length(fit_rows) + 1]] <- cbind(key, as.data.frame(as.list(round(fm[intersect(fit_names, names(fm))], 4))),
+                                                warnings = substr(r$warn, 1, 200))
+      ss <- lavaan::standardizedSolution(r$fit)
+      ss <- ss[ss$op == "=~", c("lhs", "rhs", "est.std", "se")]
+      ld_rows[[length(ld_rows) + 1]] <- cbind(key[, c("country", "variant", "route")], ss,
+                                              excluded_item = ss$rhs == nm)
+    }
+  }
+  ld <- rbindlist(ld_rows, fill = TRUE); ld[, `:=`(est.std = round(est.std, 3), se = round(se, 3))]
+  write_out(ld, f11c[1])
+  write_out(rbindlist(fit_rows, fill = TRUE), f11c[2])
+  log_run("11c", t0, "ok")
+}
+
+# -----------------------------------------------------------------------------
+# 11a. Selection bootstrap for the affordability factor alone (run last: long)
+# -----------------------------------------------------------------------------
+f11a_point <- "step11a_point_estimates.csv"
+f11a_draws <- "step11a_boot_draws.csv"
+f11a_sel   <- "step11a_boot_items.csv"
+f11a_fail  <- "step11a_boot_failures.csv"
+f11a_sum   <- c("step11a_selection_frequency.csv", "step11a_boot_summary.csv",
+                "step11a_boot_ranks.csv", "step11a_ranks_by_10a_status.csv",
+                "step11a_convergence.csv")
+p11a <- file.path(out_dir, f11a_draws); p11s <- file.path(out_dir, f11a_sel)
+p11f <- file.path(out_dir, f11a_fail)
+
+# Point estimates on the original data (affordability-only model)
+if (run_step11(f11a_point)) {
+  message("Running step 11a point estimates ..."); t0 <- Sys.time()
+  s0 <- select_partial_m(d11_full, model_afford11, afford11)
+  if (isTRUE(s0$ok)) {
+    pm <- rbindlist(list(second_stage11(s0$full, d11_rep, "afford_only_full_scalar"),
+                         second_stage11(s0$partial, d11_rep, "afford_only_partial")), fill = TRUE)
+    pm[, rank := frank(-mean, ties.method = "min"), by = method]
+    pm[, `:=`(freed_items = paste(s0$freed, collapse = ";"), criteria_met = s0$criteria_met,
+              routes = s0$routes)]
+    cm <- compare_to_main(as.data.frame(pm[method == "afford_only_partial", .(method, factor, country, mean, se)]),
+                          ref_main[ref_main$factor == "AFFORD", ], "afford_only_partial")
+    pm <- rbindlist(list(pm, data.table(method = "spearman_vs_main", factor = "AFFORD",
+                                        mean = cm$summary$spearman)), fill = TRUE)
+    write_out(pm, f11a_point)
+  } else write_out(data.frame(note = paste("selection failed:", s0$why)), f11a_point)
+  log_run("11a_point", t0, "ok")
+}
+
+done11 <- integer(0)
+if (file.exists(p11s)) done11 <- unique(fread(p11s)$replicate)
+if (file.exists(p11f)) done11 <- union(done11, unique(fread(p11f)$replicate))
+todo11 <- setdiff(seq_len(boot_B), done11)
+
+if (length(todo11) == 0 && outputs_exist(f11a_sum) && !force_rerun["step11"]) {
+  message("Step 11a complete - skipped.")
+} else {
+  message("Running step 11a: ", length(todo11), " replicates to go (long run) ...")
+  t0 <- Sys.time()
+  idx_by_c <- split(seq_len(nrow(rec)), rec$country)
+  for (b in todo11) {
+    if (as.numeric(difftime(Sys.time(), t0, units = "hours")) > boot_max_hours) {
+      message("Time budget reached; re-run the script to continue step 11a."); break
+    }
+    set.seed(boot_seed + b)                       # identical resamples to steps 09h and 10a
+    idx <- unlist(lapply(idx_by_c, function(ix) ix[sample.int(length(ix), length(ix), replace = TRUE)]),
+                  use.names = FALSE)
+    db <- rec[idx, ]
+    dfull <- db[order(db$country), c("country", afford11)]
+    drep  <- db[db$rep_sample %in% TRUE, c("country", afford11)]; drep <- drep[order(drep$country), ]
+    s <- tryCatch(select_partial_m(dfull, model_afford11, afford11),
+                  error = function(e) list(ok = FALSE, why = conditionMessage(e)))
+    if (!isTRUE(s$ok)) {
+      fwrite(data.frame(replicate = b, stage = "selection", note = substr(as.character(s$why), 1, 200)),
+             p11f, append = file.exists(p11f)); next
+    }
+    out <- list()
+    for (nm in c("full", "partial")) {
+      m2 <- tryCatch(second_stage11(s[[nm]], drep, paste0("scalar_", nm)), error = function(e) NULL)
+      if (!is.null(m2)) out[[nm]] <- data.frame(replicate = b, m2[, c("method", "factor", "country", "mean", "stage2")])
+    }
+    if (length(out) < 2) {
+      fwrite(data.frame(replicate = b, stage = "second_stage", note = "not converged"),
+             p11f, append = file.exists(p11f)); next
+    }
+    fwrite(rbindlist(out), p11a, append = file.exists(p11a))
+    fwrite(data.frame(replicate = b, freed_items = paste(sort(s$freed), collapse = ";"),
+                      release_order = paste(s$freed, collapse = ";"), n_released = length(s$freed),
+                      criteria_met = s$criteria_met, routes = s$routes),
+           p11s, append = file.exists(p11s))
+    if (b %% 10 == 0) message("  step 11a replicate ", b, " of ", boot_B, " (",
+                              round(as.numeric(difftime(Sys.time(), t0, units = "hours")), 2), " h)")
+  }
+
+  if (file.exists(p11s) && file.exists(p11a)) {
+    sel <- fread(p11s); nb <- nrow(sel)
+    if (nb >= 20) {
+      main_set <- paste(sort(final_items), collapse = ";")
+      it_freq <- rbindlist(lapply(afford11, function(it)
+        data.frame(type = "item", value = it,
+                   share = round(mean(grepl(paste0("(^|;)", it, "(;|$)"), sel$freed_items)), 3))))
+      set_freq <- sel[, .(share = round(.N / nb, 3)), by = .(value = freed_items)][order(-share)]
+      set_freq[, type := ifelse(value == main_set, "item_set (main)", "item_set")]
+      write_out(rbind(data.frame(it_freq), data.frame(set_freq)[, c("type", "value", "share")],
+                      data.frame(type = "replicates", value = "successful", share = nb)), f11a_sum[1])
+
+      bd <- fread(p11a)
+      sm <- bd[, .(n_replicates = .N, boot_mean = round(mean(mean), 4), boot_se = round(sd(mean), 4),
+                   ci_lo = round(quantile(mean, 0.025), 4), ci_hi = round(quantile(mean, 0.975), 4)),
+               by = .(method, factor, country)]
+      write_out(sm[order(method, -boot_mean)], f11a_sum[2])
+      bd[, rank := as.numeric(frank(-mean, ties.method = "min")), by = .(replicate, method, factor)]
+      rank_stats <- function(x) x[, .(rank_q025 = quantile(rank, 0.025), rank_median = median(rank),
+                                      rank_q975 = quantile(rank, 0.975), p_rank1 = round(mean(rank == 1), 3),
+                                      p_top3 = round(mean(rank <= 3), 3), n_replicates = .N),
+                                  by = .(method, factor, country)]
+      rr <- rank_stats(bd)
+      write_out(rr[order(method, rank_median)], f11a_sum[3])
+
+      # Do the replicates lost in step 10a differ from those kept?
+      p10ok <- file.path(out_dir, "step10a_boot_select_items.csv")
+      ok10 <- if (file.exists(p10ok)) unique(fread(p10ok)$replicate) else integer(0)
+      bd[, status_10a := ifelse(replicate %in% ok10, "converged_in_10a", "failed_in_10a")]
+      rs <- bd[, .(rank_q025 = quantile(rank, 0.025), rank_median = median(rank),
+                   rank_q975 = quantile(rank, 0.975), p_top3 = round(mean(rank <= 3), 3),
+                   mean_latent = round(mean(mean), 4), n_replicates = .N),
+               by = .(status_10a, method, factor, country)]
+      write_out(rs[order(status_10a, method, rank_median)], f11a_sum[4])
+
+      fl <- if (file.exists(p11f)) fread(p11f) else data.table(replicate = integer(0), stage = character(0))
+      conv <- data.table(item = c("replicates_attempted", "converged", "failed_selection",
+                                  "failed_second_stage", "converged_in_10a", "converged_here_but_failed_in_10a",
+                                  "second_stage_route_B_rows"),
+                         value = c(nb + nrow(fl), nb, sum(fl$stage == "selection"),
+                                   sum(fl$stage == "second_stage"), length(ok10),
+                                   length(setdiff(sel$replicate, ok10)),
+                                   sum(bd$stage2 == "B_factor_scores")))
+      write_out(conv, f11a_sum[5])
+    }
+  }
+  log_run("11a", t0, paste0("replicates_ok=", if (file.exists(p11s)) nrow(fread(p11s)) else 0))
+}
+
+# =============================================================================
+# STEP 12 - Remaining non-invariance after the partial release
+# =============================================================================
+# 12a Intercept diagnostics (modification indices and standardised expected
+#     parameter changes) under the final partial scalar model, next to the
+#     full scalar model, and the item that would be released next
+# 12b Rankings when one more intercept is released: (i) the next item chosen
+#     by the release rule, in all countries; (ii) difficulty living on current
+#     income released in Finland only
+
+run_step12 <- function(files) force_rerun["step12"] || !outputs_exist(files)
+
+main_freed12 <- strsplit(as.character(pp9[.N, freed_items]), ";")[[1]]
+main_freed12 <- main_freed12[nzchar(main_freed12)]
+
+f12a <- c("step12a_intercept_diagnostics.csv", "step12a_item_totals.csv")
+if (!run_step12(f12a)) { message("Step 12a outputs found - skipped.") } else {
+  message("Running step 12a ..."); t0 <- Sys.time()
+  fits12 <- list(full_scalar = fit_partial_m(d9_full, inv_model, character(0)),
+                 partial_main = fit_partial_m(d9_full, inv_model, main_freed12))
+  diag12 <- list(); tot12 <- list()
+  for (nm in names(fits12)) {
+    f <- fits12[[nm]]$fit
+    if (!ok_fit(f)) { diag12[[nm]] <- data.table(model = nm, note = "not converged"); next }
+    st <- score_table(f)
+    if (is.null(st)) { diag12[[nm]] <- data.table(model = nm, note = "no diagnostics"); next }
+    st <- as.data.table(st)[source == "mod_index"]
+    st[, model := nm][, route := fits12[[nm]]$route]
+    diag12[[nm]] <- st[, .(model, route, item, country, mi = stat, sepc = epc)]
+    # Total modification index per item = the quantity used by the release rule
+    tt <- st[!(item %in% if (nm == "partial_main") main_freed12 else character(0)),
+             .(total_mi = round(sum(stat, na.rm = TRUE), 1),
+               max_abs_sepc = round(max(abs(epc), na.rm = TRUE), 3),
+               country_max = country[which.max(abs(epc))]), by = item]
+    tt[, model := nm][, rank_next := frank(-total_mi, ties.method = "min")]
+    tot12[[nm]] <- tt[order(rank_next)]
+  }
+  write_out(rbindlist(diag12, fill = TRUE), f12a[1])
+  write_out(rbindlist(tot12, fill = TRUE), f12a[2])
+  log_run("12a", t0, "ok")
+}
+
+f12b <- c("step12b_fit.csv", "step12b_ranks.csv")
+if (!run_step12(f12b)) { message("Step 12b outputs found - skipped.") } else {
+  message("Running step 12b ..."); t0 <- Sys.time()
+  tot <- fread(file.path(out_dir, f12a[2]))
+  next_item <- tot[model == "partial_main"][order(-total_mi)][1, item]
+  countries <- sort(unique(d9_full$country))
+  specs <- list(
+    main = list(type = "all", items = main_freed12),
+    plus_next_all = list(type = "all", items = c(main_freed12, next_item)),
+    plus_income_FI = list(type = "country", items = main_freed12, extra = "FIN_COMF", country = "FI"))
+  rm_fit <- fit_invariance(inv_levels$metric, d9_full)
+  fm0 <- if (ok_fit(rm_fit$fit)) lavaan::fitMeasures(rm_fit$fit) else NULL
+  fit_rows <- list(); rank_rows <- list()
+  for (nm in names(specs)) {
+    sp <- specs[[nm]]
+    if (sp$type == "all") {
+      r <- fit_partial_m(d9_full, inv_model, sp$items)
+    } else {
+      rel <- rbind(expand.grid(item = sp$items, country = countries[-1], stringsAsFactors = FALSE),
+                   data.frame(item = sp$extra, country = sp$country))
+      r <- release_country_specific(d9_full, rel, model = inv_model)
+      r$route <- paste0("release_by_", r$route)
+    }
+    if (!ok_fit(r$fit)) { fit_rows[[nm]] <- data.frame(spec = nm, route = "failed"); next }
+    fr <- fit_row(r$fit, nm); fr$spec <- nm; fr$route <- r$route
+    fr$released <- if (sp$type == "all") paste(sp$items, collapse = ";") else
+      paste0(paste(sp$items, collapse = ";"), ";", sp$extra, "@", sp$country)
+    if (!is.null(fm0)) {
+      fr$delta_cfi_vs_metric <- round(fr$cfi.scaled - fm0[["cfi.scaled"]], 4)
+      fr$delta_rmsea_vs_metric <- round(fr$rmsea.scaled - fm0[["rmsea.scaled"]], 4)
+    }
+    fit_rows[[nm]] <- fr
+    m2 <- second_stage11(r$fit, d9_rep, nm)
+    if (!is.null(m2)) {
+      m2 <- as.data.table(m2)[factor == "AFFORD"]
+      m2[, rank := frank(-mean, ties.method = "min")]
+      m2[, spec := nm]
+      rank_rows[[nm]] <- m2[, .(spec, factor, country, mean, se, rank, stage2)]
+    }
+  }
+  rk <- rbindlist(rank_rows, fill = TRUE)
+  if (nrow(rk) > 0 && "main" %in% rk$spec) {
+    base <- rk[spec == "main", .(country, rank_main = rank)]
+    rk <- merge(rk, base, by = "country", all.x = TRUE)
+    sp_cor <- rk[, .(spearman_vs_main = round(cor(rank, rank_main, method = "spearman"), 3)), by = spec]
+    rk <- merge(rk, sp_cor, by = "spec", all.x = TRUE)
+  }
+  write_out(rbindlist(fit_rows, fill = TRUE), f12b[1])
+  write_out(rk[order(spec, rank)], f12b[2])
+  log_run("12b", t0, paste0("next_item=", next_item))
+}
+
+# =============================================================================
+# STEP 08 - Publication tables and figures
+# =============================================================================
+# Figures: Arial 8 pt, width 174 mm or 84 mm, Okabe-Ito colours with shapes or
+# line types; each written as vector PDF and 1200 dpi TIFF.
+# Route A: cairo devices; route B: base pdf()/tiff() devices.
+# Fig1 = intercept heat map, Fig2 = affordability ranks, Fig3 = affordability
+# latent means with 95% intervals.
+# Dwelling-defect ranks exclude countries listed in `dwell_exclude`.
+
+suppressPackageStartupMessages(library(ggplot2))
+
+okabe <- c(orange = "#E69F00", sky = "#56B4E9", green = "#009E73", yellow = "#F0E442",
+           blue = "#0072B2", vermillion = "#D55E00", purple = "#CC79A7", grey = "#7F7F7F")
+
+country_names <- c(BE = "Belgium (Flanders)", CZ = "Czechia", DE = "Germany", EE = "Estonia",
+                   FI = "Finland", IT = "Italy", RO = "Romania", UK = "United Kingdom")
+item_labels <- c(
+  DP_LEAK = "Leaking roof", DP_DAMP = "Damp walls, floors or foundation",
+  DP_ROT = "Rot in window frames or floor", DP_MOULD1 = "Mould around windows or in bathroom",
+  DP_MOULD2 = "Mould on walls", AFF_HEAT = "Cannot afford adequate heating",
+  ARREARS = "Arrears on energy bills", FINBURDEN_ECOST = "Energy costs a major burden",
+  FIN_BURD_HOUSECOST = "Housing costs a burden", FIN_COMF = "Difficulty living on current income",
+  RED_LIVING_COST_LESS_FOOD = "Buying less food or essentials",
+  RED_LIVING_COST_BORROW_MONEY = "Borrowing from family or friends",
+  RED_LIVING_COST_USE_CREDIT = "Using more credit or debt")
+factor_labels <- c(AFFORD = "Affordability strain", DWELL = "Dwelling defects")
+
+font_family <- if (.Platform$OS.type == "windows") {
+  tryCatch({ windowsFonts(Arial = windowsFont("Arial")); "Arial" }, error = function(e) "sans")
+} else "sans"
+
+theme_pub <- function(grey_panel = FALSE) {
+  bg <- theme()
+  if (grey_panel) bg <- theme(panel.background = element_rect(fill = "grey94", colour = NA),
+                              panel.grid.major = element_line(colour = "white", linewidth = 0.35))
+  theme_classic(base_size = 8, base_family = font_family) + bg +
+    theme(axis.text = element_text(size = 8, colour = "black"),
+          axis.title = element_text(size = 8),
+          strip.text = element_text(size = 8, face = "bold", hjust = 0),
+          strip.background = element_blank(),
+          legend.text = element_text(size = 8), legend.title = element_text(size = 8),
+          axis.line = element_line(linewidth = 0.35), axis.ticks = element_line(linewidth = 0.35),
+          plot.margin = margin(3, 3, 3, 3, "mm"))
+}
+
+# Render to a temporary file first, then copy over the target. Cairo reports a
+# failed write only as a warning, so warnings are captured and checked. A target
+# that is open in a PDF/image viewer cannot be overwritten: this is reported.
+render_device <- function(p, target, open_device) {
+  tmp <- tempfile(fileext = paste0(".", tools::file_ext(target)))
+  msgs <- character(0)
+  ok <- withCallingHandlers(
+    tryCatch({ open_device(tmp); print(p); grDevices::dev.off(); TRUE },
+             error = function(e) { msgs <<- c(msgs, conditionMessage(e))
+                                   try(grDevices::dev.off(), silent = TRUE); FALSE }),
+    warning = function(w) { msgs <<- c(msgs, conditionMessage(w)); invokeRestart("muffleWarning") })
+  if (!ok || !file.exists(tmp) || file.info(tmp)$size == 0 ||
+      any(grepl("cairo error|error while writing", msgs))) return("render_failed")
+  if (!isTRUE(file.copy(tmp, target, overwrite = TRUE))) return("target_locked")
+  unlink(tmp)
+  "ok"
+}
+
+save_figure <- function(p, name, width_mm, height_mm) {
+  pdf_file  <- file.path(out_dir, paste0(name, ".pdf"))
+  tiff_file <- file.path(out_dir, paste0(name, ".tiff"))
+  w <- width_mm / 25.4; h <- height_mm / 25.4
+
+  # PDF - route A: cairo_pdf (embedded fonts); route B: base pdf()
+  pdf_route <- "A_cairo_pdf"
+  st <- render_device(p, pdf_file, function(f) grDevices::cairo_pdf(f, width = w, height = h,
+                                                                      family = font_family))
+  if (st == "render_failed") {
+    pdf_route <- "B_pdf"
+    st <- render_device(p, pdf_file, function(f) grDevices::pdf(f, width = w, height = h,
+                                                                 useDingbats = FALSE))
+  }
+  pdf_status <- st
+
+  # TIFF 1200 dpi - route A: cairo; route B: default device type
+  tiff_route <- "A_cairo_tiff"
+  st <- render_device(p, tiff_file, function(f) grDevices::tiff(f, width = w, height = h, units = "in",
+                                                                 res = 1200, compression = "lzw",
+                                                                 type = "cairo"))
+  if (st == "render_failed") {
+    tiff_route <- "B_tiff"
+    st <- render_device(p, tiff_file, function(f) grDevices::tiff(f, width = w, height = h, units = "in",
+                                                                   res = 1200, compression = "lzw"))
+  }
+  tiff_status <- st
+
+  if (pdf_status == "target_locked" || tiff_status == "target_locked")
+    warning(name, ": output file is open in another program (close the PDF/TIFF viewer and re-run).",
+            call. = FALSE)
+  data.frame(figure = name, pdf_route = pdf_route, pdf_status = pdf_status,
+             tiff_route = tiff_route, tiff_status = tiff_status,
+             width_mm = width_mm, height_mm = height_mm, dpi = 1200)
+}
+
+step08_files <- c("Fig1.pdf", "Fig1.tiff", "Fig2.pdf", "Fig2.tiff", "Fig3.pdf", "Fig3.tiff",
+                  "step08_figure_log.csv")
+
+if (!force_rerun["step08"] && outputs_exist(step08_files)) {
+  message("Step 08 outputs found - skipped.")
+} else {
+  message("Running step 08 ...")
+  rd <- function(f) as.data.frame(fread(file.path(out_dir, f), encoding = "UTF-8"))
+
+  m5  <- rd("step05_country_means.csv")
+  m5r <- as.data.frame(rank_excl(m5))           # ranks without non-identified means
+  u6  <- if (file.exists(file.path(out_dir, "step09a_rank_uncertainty.csv")))
+           rd("step09a_rank_uncertainty.csv") else rd("step06_rank_uncertainty.csv")
+  sc4 <- rd("step04_score_tests_scalar.csv")
+  pp4 <- rd("step04_partial_path.csv")
+  freed <- strsplit(as.character(pp4$freed_items[nrow(pp4)]), ";")[[1]]
+  freed <- freed[!is.na(freed) & nzchar(freed)]
+
+  # ---------------- Figure 2: affordability ranks across scoring approaches --
+  # Affordability factor only. Columns: observed composite, full scalar, main
+  # partial scalar and the two alternative anchor sets of step 07.
+  meth_map <- c(observed_composite = "Observed\ncomposite",
+                scalar_full_twostage = "Full scalar\ninvariance",
+                scalar_partial_twostage = "Partial scalar\n(main)",
+                energy_items_only = "Partial scalar\n(energy items\nonly)",
+                main_plus_fin_comf = "Partial scalar\n(main + income\nitem)")
+  f1 <- m5r[m5r$method %in% names(meth_map)[1:3] & m5r$factor == "AFFORD",
+            c("method", "country", "rank")]
+  anc_path <- file.path(out_dir, "step07_anchor_sensitivity.csv")
+  if (file.exists(anc_path)) {
+    an <- rd("step07_anchor_sensitivity.csv")
+    an <- an[an$factor == "AFFORD" & an$anchor_set %in% names(meth_map), ]
+    if (nrow(an)) f1 <- rbind(f1, data.frame(method = an$anchor_set, country = an$country, rank = an$rank_new))
+  }
+  meth_map <- meth_map[names(meth_map) %in% unique(f1$method)]
+  f1$method_lab <- factor(meth_map[f1$method], levels = meth_map)
+  f1$x <- as.numeric(f1$method_lab)
+  nx <- length(meth_map)
+  hl <- c(FI = okabe[["vermillion"]], IT = okabe[["blue"]], EE = okabe[["purple"]])
+  f1$grp <- ifelse(f1$country %in% names(hl), f1$country, "other")
+  ends <- f1[f1$x %in% c(1, nx), ]
+  ends <- aggregate(country ~ x + rank, data = ends, FUN = function(z) paste(sort(z), collapse = "/"))
+  ends$xl <- ifelse(ends$x == 1, 1 - 0.12, nx + 0.12)
+  ends$hj <- ifelse(ends$x == 1, 1, 0)
+
+  p1 <- ggplot(f1, aes(x = x, y = rank, group = country)) +
+    annotate("rect", xmin = 2.75, xmax = 3.25, ymin = 0.6, ymax = 8.4, fill = "white", alpha = 0.6) +
+    geom_line(aes(colour = grp, linetype = grp, linewidth = grp)) +
+    geom_point(aes(colour = grp, shape = grp), size = 1.8, fill = "white") +
+    geom_text(data = ends, aes(x = xl, y = rank, label = country, hjust = hj),
+              inherit.aes = FALSE, size = 8 / .pt, family = font_family) +
+    scale_y_reverse(breaks = 1:8, limits = c(8.4, 0.6)) +
+    scale_x_continuous(breaks = seq_len(nx), labels = meth_map, limits = c(0.35, nx + 0.65)) +
+    scale_colour_manual(values = c(hl, other = okabe[["grey"]]), guide = "none") +
+    scale_linetype_manual(values = c(FI = "solid", IT = "longdash", EE = "dotdash",
+                                     other = "solid"), guide = "none") +
+    scale_linewidth_manual(values = c(FI = 0.8, IT = 0.8, EE = 0.8, other = 0.4), guide = "none") +
+    scale_shape_manual(values = c(FI = 16, IT = 17, EE = 15, other = 21), guide = "none") +
+    labs(x = NULL, y = "Country rank on affordability strain (1 = most deprived)") +
+    theme_pub(grey_panel = TRUE) +
+    theme(panel.grid.major.x = element_blank())
+
+  # ---------------- Figure 1: intercept non-invariance heat map --------------
+  # Items are grouped into three blocks; cells without an estimable diagnostic
+  # are left blank.
+  f2 <- sc4[sc4$source == "mod_index" & sc4$item %in% cfa_items, c("item", "country", "epc")]
+  grid <- expand.grid(item = cfa_items, country = names(country_names), stringsAsFactors = FALSE)
+  f2 <- merge(grid, f2, by = c("item", "country"), all.x = TRUE)
+  f2$block <- ifelse(f2$item %in% cfa_dwell, "a  Dwelling\n    defects",
+                     ifelse(f2$item %in% freed, "c  Affordability:\n    released\n    intercepts",
+                            "b  Affordability:\n    invariant\n    intercepts"))
+  f2$block <- factor(f2$block, levels = c("a  Dwelling\n    defects",
+                                          "b  Affordability:\n    invariant\n    intercepts",
+                                          "c  Affordability:\n    released\n    intercepts"))
+  item_order <- c(cfa_dwell, setdiff(c(cfa_energy, cfa_cost), freed), intersect(cfa_items, freed))
+  f2$lab_item <- factor(item_labels[f2$item], levels = rev(item_labels[item_order]))
+  f2$txt <- ifelse(is.na(f2$epc), "", formatC(f2$epc, format = "f", digits = 2))
+  lim <- ceiling(max(abs(f2$epc), na.rm = TRUE) * 10) / 10
+  p2 <- ggplot(f2, aes(x = country, y = lab_item, fill = epc)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label = txt), size = 8 / .pt, family = font_family) +
+    scale_fill_gradient2(low = okabe[["blue"]], mid = "white", high = okabe[["vermillion"]],
+                         midpoint = 0, limits = c(-lim, lim), na.value = "grey92",
+                         name = "Standardised expected parameter change",
+                         guide = guide_colourbar(theme = theme(legend.key.width = unit(60, "mm"),
+                                                               legend.key.height = unit(3, "mm")))) +
+    scale_x_discrete(position = "top") +
+    facet_grid(block ~ ., scales = "free_y", space = "free_y") +
+    labs(x = NULL, y = NULL) +
+    theme_pub() +
+    theme(axis.line = element_blank(), axis.ticks = element_blank(),
+          strip.text.y = element_text(angle = 0, hjust = 0, size = 8, face = "bold"),
+          panel.spacing = unit(2.5, "mm"),
+          legend.position = "bottom", legend.title.position = "top",
+          legend.justification = "center", legend.title = element_text(hjust = 0.5))
+
+  # ---------------- Figure 3: affordability latent means with 95% intervals --
+  # Belgium (Flanders) is the reference (zero) and is not plotted.
+  # Intervals: Route A bootstrap percentile intervals that repeat the intercept
+  # selection (step 10a); route B bootstrap of the main specification (step 09h,
+  # partial model) with conditional intervals for the full model; route C
+  # conditional (model-based) intervals for both models.
+  f3 <- m5[m5$method %in% c("scalar_full_twostage", "scalar_partial_twostage") &
+             m5$factor == "AFFORD" & m5$country != "BE", ]
+  f3$lo <- f3$mean - 1.96 * f3$se; f3$hi <- f3$mean + 1.96 * f3$se
+  ci_route <- "C_conditional"
+  bs10 <- file.path(out_dir, "step10a_boot_select_summary.csv")
+  bs09 <- file.path(out_dir, "step09h_bootstrap_summary.csv")
+  if (file.exists(bs10)) {
+    b10 <- rd("step10a_boot_select_summary.csv"); b10 <- b10[b10$factor == "AFFORD", ]
+    b10$method <- ifelse(b10$method == "scalar_full", "scalar_full_twostage", "scalar_partial_twostage")
+    k <- match(paste(f3$method, f3$country), paste(b10$method, b10$country))
+    if (all(!is.na(k))) { f3$lo <- b10$ci_lo[k]; f3$hi <- b10$ci_hi[k]; ci_route <- "A_bootstrap_with_selection" }
+  }
+  if (ci_route == "C_conditional" && file.exists(bs09)) {
+    b09 <- rd("step09h_bootstrap_summary.csv"); b09 <- b09[b09$factor == "AFFORD", ]
+    k <- match(f3$country, b09$country); sel <- f3$method == "scalar_partial_twostage" & !is.na(k)
+    f3$lo[sel] <- b09$ci_lo[k[sel]]; f3$hi[sel] <- b09$ci_hi[k[sel]]; ci_route <- "B_bootstrap_main_only"
+  }
+  message("Figure 3 interval route: ", ci_route)
+  f3$model <- factor(ifelse(f3$method == "scalar_full_twostage", "Full scalar invariance",
+                            "Partial scalar invariance"),
+                     levels = c("Full scalar invariance", "Partial scalar invariance"))
+  ord <- f3[f3$method == "scalar_partial_twostage", ]
+  lev <- ord$country[order(ord$mean)]
+  f3$cn <- factor(country_names[f3$country], levels = country_names[lev])
+  f3$y  <- as.numeric(f3$cn) + ifelse(f3$model == "Full scalar invariance", 0.17, -0.17)
+  p3 <- ggplot(f3, aes(y = y, colour = model, shape = model)) +
+    geom_vline(xintercept = 0, linewidth = 0.35, linetype = "dashed", colour = "grey40") +
+    geom_errorbar(aes(xmin = lo, xmax = hi), orientation = "y", width = 0, linewidth = 0.5) +
+    geom_point(aes(x = mean), size = 1.8) +
+    scale_y_continuous(breaks = seq_along(levels(f3$cn)), labels = levels(f3$cn),
+                       expand = expansion(add = 0.5)) +
+    scale_colour_manual(values = c(okabe[["blue"]], okabe[["vermillion"]]), name = NULL) +
+    scale_shape_manual(values = c(1, 17), name = NULL) +
+    labs(x = "Latent mean of affordability strain relative to Belgium (Flanders)", y = NULL) +
+    theme_pub(grey_panel = TRUE) +
+    theme(legend.key = element_rect(fill = NA, colour = NA),
+          axis.title.x = element_text(margin = margin(t = 3, unit = "mm")),
+          legend.position = "bottom", legend.margin = margin(t = 1, unit = "mm"))
+
+  fig_log <- rbind(save_figure(p2, "Fig1", 174, 135),
+                   save_figure(p1, "Fig2", 174, 100),
+                   save_figure(p3, "Fig3", 120, 85))
+
+  # ---------------- Tables --------------------------------------------------
+  # Table 1 prevalence (stratified subsample): share in the deprived categories.
+  # Multi-category burden items use their upper categories, because "any value
+  # above zero" covers almost all respondents for these items.
+  dict <- rd("step01_item_dictionary.csv")
+  dist <- as.data.table(rd("step01_item_distribution.csv"))
+  dist <- dist[sample == "representative" & item %in% cfa_items & !is.na(category) &
+                 country %in% names(country_names)]
+  prev_cut <- c(FINBURDEN_ECOST = 3, FIN_COMF = 3, FIN_BURD_HOUSECOST = 2)
+  prev_def <- c(FINBURDEN_ECOST = "agree or strongly agree",
+                FIN_COMF = "finding it difficult or very difficult",
+                FIN_BURD_HOUSECOST = "heavy burden")
+  dist[, cut := ifelse(item %in% names(prev_cut), prev_cut[item], 1)]
+  pv <- dist[, .(pct = round(100 * sum(N[category >= cut]) / sum(N), 2)), by = .(item, country)]
+  pv <- as.data.frame(dcast(pv, item ~ country, value.var = "pct"))
+  t1 <- merge(dict[dict$item %in% cfa_items, c("item", "construct", "coding", "question_wording")],
+              pv[, c("item", names(country_names))], by = "item")
+  t1$construct <- ifelse(t1$item %in% cfa_dwell, "Dwelling defects", "Affordability strain")
+  t1$label <- item_labels[t1$item]
+  t1$prevalence_definition <- ifelse(t1$item %in% names(prev_def), prev_def[t1$item], "any (score > 0)")
+  t1 <- t1[match(cfa_items, t1$item), c("construct", "item", "label", "question_wording", "coding",
+                                        "prevalence_definition", names(country_names))]
+
+  fit2 <- rd("step02_fit_by_country.csv")
+  t2 <- fit2[fit2$sample == "full", c("country", "model", "n", "chisq.scaled", "df.scaled",
+                                      "cfi.scaled", "tli.scaled", "rmsea.scaled", "srmr")]
+
+  inv <- rd("step03_invariance_fit.csv"); invt <- rd("step03_invariance_tests.csv")
+  t3a <- merge(inv[, c("level", "chisq.scaled", "df.scaled", "cfi.scaled", "tli.scaled",
+                       "rmsea.scaled", "srmr")],
+               invt[, c("restricted", "delta_cfi", "delta_rmsea", "delta_srmr")],
+               by.x = "level", by.y = "restricted", all.x = TRUE)
+  t3a <- t3a[match(c("configural", "thresholds", "metric", "scalar"), t3a$level), ]
+  t3b <- pp4
+
+  wide_rank <- function(meth, lab) {
+    x <- m5[m5$method == meth, c("factor", "country", "mean", "se")]
+    r <- m5r[m5r$method == meth, c("factor", "country", "rank")]
+    x <- merge(x, r, by = c("factor", "country"), all.x = TRUE)
+    names(x)[3:5] <- paste0(lab, c("_mean", "_se", "_rank")); x
+  }
+  t4 <- Reduce(function(a, b) merge(a, b, by = c("factor", "country")),
+               list(wide_rank("observed_composite", "observed"),
+                    wide_rank("scalar_full_twostage", "full"),
+                    wide_rank("scalar_partial_twostage", "partial")))
+  for (mm in c("full", "partial")) {
+    uu <- u6[u6$method == paste0("scalar_", mm, "_twostage_freevar"),
+             c("factor", "country", "rank_q025", "rank_q975")]
+    names(uu)[3:4] <- paste0(mm, c("_rank_lo95", "_rank_hi95"))
+    t4 <- merge(t4, uu, by = c("factor", "country"), all.x = TRUE)
+  }
+  t4$observed_se <- NULL
+  dw_fi <- t4$factor == "DWELL" & t4$country %in% dwell_exclude
+  t4[dw_fi, c("full_mean", "full_se", "partial_mean", "partial_se", "observed_rank", "full_rank",
+              "partial_rank", "full_rank_lo95", "full_rank_hi95", "partial_rank_lo95",
+              "partial_rank_hi95")] <- NA
+  t4$note <- ifelse(dw_fi, "Latent mean not identified (floor of binary indicators); not ranked", "")
+  t4 <- t4[order(t4$factor, t4$partial_rank), ]
+
+  t5a <- rd("step07_loco_summary.csv")
+  t5b <- rd("step07_anchor_sensitivity.csv")
+
+  or1 <- rd("step03_configural_loadings.csv")
+  or2 <- sc4[sc4$source == "mod_index", c("item", "country", "stat", "epc")]
+  names(or2)[3:4] <- c("modification_index", "standardised_epc")
+  fc  <- rd("step02_factor_correlations.csv")
+  or3 <- fc[fc$sample == "full" & fc$model == "M3_three_factor", ]
+  or4 <- u6
+  or5 <- rd("step06_country_means_sensitivity.csv")
+  or6 <- rd("step07_loco_ranks.csv")
+
+  # Step 09 robustness outputs (included when available)
+  rd_opt <- function(f) if (file.exists(file.path(out_dir, f))) rd(f) else data.frame(note = "not available")
+  tabs <- list(Table1_items = t1, Table2_fit_by_country = t2,
+               Table3a_invariance = t3a, Table3b_partial_release = t3b,
+               Table4_country_means = t4, Table5a_leave_one_out = t5a,
+               Table5b_anchor_sets = t5b,
+               OR1_configural_parameters = or1, OR2_intercept_diagnostics = or2,
+               OR3_three_factor_correlations = or3, OR4_rank_uncertainty = or4,
+               OR5_variance_sensitivity = or5, OR6_leave_one_out_ranks = or6,
+               R09b_sample_invariance = rd_opt("step09b_sample_invariance_tests.csv"),
+               R09c_district_heat_share = rd_opt("step09c_district_heating_share.csv"),
+               R09c_mimic_by_country = rd_opt("step09c_mimic_by_country.csv"),
+               R09c_mimic_pooled = rd_opt("step09c_mimic_pooled.csv"),
+               R09d_strict_fit = rd_opt("step09d_strict_fit.csv"),
+               R09d_strict_ranks = rd_opt("step09d_strict_ranks.csv"),
+               R09e_cs_releases = rd_opt("step09e_country_specific_releases.csv"),
+               R09e_cs_fit = rd_opt("step09e_country_specific_fit.csv"),
+               R09e_cs_ranks = rd_opt("step09e_country_specific_ranks.csv"),
+               R09f_no_rescov_fit = rd_opt("step09f_no_rescov_fit.csv"),
+               R09f_no_rescov_ranks = rd_opt("step09f_no_rescov_ranks.csv"),
+               R09g_topup_counts = rd_opt("step09g_topup_counts.csv"),
+               R09g_no_topup_ranks = rd_opt("step09g_no_topup_ranks.csv"),
+               R09h_bootstrap_means = rd_opt("step09h_bootstrap_summary.csv"),
+               R09h_bootstrap_ranks = rd_opt("step09h_bootstrap_ranks.csv"),
+               R09a_rank_uncertainty = rd_opt("step09a_rank_uncertainty.csv"),
+               R10a_selection_freq = rd_opt("step10a_selection_frequency.csv"),
+               R10a_boot_select_means = rd_opt("step10a_boot_select_summary.csv"),
+               R10a_boot_select_ranks = rd_opt("step10a_boot_select_ranks.csv"),
+               R10b_cutoff_fit = rd_opt("step10b_cutoff_fit.csv"),
+               R10b_cutoff_ranks = rd_opt("step10b_cutoff_ranks.csv"),
+               R10c_onestage_fit = rd_opt("step10c_onestage_fit.csv"),
+               R10c_onestage_ranks = rd_opt("step10c_onestage_ranks.csv"),
+               R11a_point = rd_opt("step11a_point_estimates.csv"),
+               R11a_convergence = rd_opt("step11a_convergence.csv"),
+               R11a_selection_freq = rd_opt("step11a_selection_frequency.csv"),
+               R11a_boot_means = rd_opt("step11a_boot_summary.csv"),
+               R11a_boot_ranks = rd_opt("step11a_boot_ranks.csv"),
+               R11a_by_10a_status = rd_opt("step11a_ranks_by_10a_status.csv"),
+               R11b_partial_fit = rd_opt("step11b_partial_fit.csv"),
+               R11c_excluded_loadings = rd_opt("step11c_excluded_loadings.csv"),
+               R11c_excluded_fit = rd_opt("step11c_excluded_fit.csv"),
+               R12a_intercept_diag = rd_opt("step12a_intercept_diagnostics.csv"),
+               R12a_item_totals = rd_opt("step12a_item_totals.csv"),
+               R12b_fit = rd_opt("step12b_fit.csv"),
+               R12b_ranks = rd_opt("step12b_ranks.csv"))
+
+  ok_xlsx <- tryCatch({
+    wb <- openxlsx::createWorkbook()
+    for (nm in names(tabs)) {
+      openxlsx::addWorksheet(wb, substr(nm, 1, 31))
+      openxlsx::writeData(wb, substr(nm, 1, 31), tabs[[nm]])
+    }
+    openxlsx::saveWorkbook(wb, file.path(out_dir, "step08_tables.xlsx"), overwrite = TRUE)
+    TRUE }, error = function(e) { message("xlsx failed: ", conditionMessage(e)); FALSE })
+  if (!ok_xlsx) {
+    for (nm in names(tabs)) write_out(tabs[[nm]], paste0("step08_", nm, ".csv"))
+  }
+  write_out(cbind(fig_log, tables = ifelse(ok_xlsx, "step08_tables.xlsx", "csv files")),
+            "step08_figure_log.csv")
+}
+
+message("Pipeline finished. Outputs: ", out_dir)
